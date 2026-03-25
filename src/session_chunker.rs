@@ -53,16 +53,11 @@ pub fn parse_session_jsonl(path: &Path) -> anyhow::Result<Vec<SessionChunk>> {
         let (role, text) = &messages[i];
 
         if role == "user" {
+            let q_text = truncate_text(text, MAX_CHUNK_CHARS);
             if i + 1 < messages.len() && messages[i + 1].0 == "assistant" {
-                let assistant_text = &messages[i + 1].1;
-                let truncated = if assistant_text.chars().count() > MAX_CHUNK_CHARS {
-                    let s: String = assistant_text.chars().take(MAX_CHUNK_CHARS).collect();
-                    format!("{s}...")
-                } else {
-                    assistant_text.clone()
-                };
+                let a_text = truncate_text(&messages[i + 1].1, MAX_CHUNK_CHARS);
 
-                let pair = format!("Q: {text}\nA: {truncated}");
+                let pair = format!("Q: {q_text}\nA: {a_text}");
                 if pair.chars().count() <= MAX_CHUNK_CHARS * 2 {
                     chunks.push(SessionChunk {
                         content: pair,
@@ -71,11 +66,11 @@ pub fn parse_session_jsonl(path: &Path) -> anyhow::Result<Vec<SessionChunk>> {
                 } else {
                     // Split into separate Q and A chunks
                     chunks.push(SessionChunk {
-                        content: format!("Q: {text}"),
+                        content: format!("Q: {q_text}"),
                         chunk_index: chunks.len(),
                     });
                     chunks.push(SessionChunk {
-                        content: format!("A: {truncated}"),
+                        content: format!("A: {a_text}"),
                         chunk_index: chunks.len(),
                     });
                 }
@@ -84,22 +79,30 @@ pub fn parse_session_jsonl(path: &Path) -> anyhow::Result<Vec<SessionChunk>> {
             }
             // Orphan user message
             chunks.push(SessionChunk {
-                content: format!("Q: {text}"),
+                content: format!("Q: {q_text}"),
                 chunk_index: chunks.len(),
             });
         } else {
             // Orphan assistant message
-            if text.chars().count() <= MAX_CHUNK_CHARS {
-                chunks.push(SessionChunk {
-                    content: text.clone(),
-                    chunk_index: chunks.len(),
-                });
-            }
+            let a_text = truncate_text(text, MAX_CHUNK_CHARS);
+            chunks.push(SessionChunk {
+                content: a_text,
+                chunk_index: chunks.len(),
+            });
         }
         i += 1;
     }
 
     Ok(chunks)
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let s: String = text.chars().take(max_chars).collect();
+        format!("{s}...")
+    }
 }
 
 fn extract_text_content(message: &serde_json::Value) -> Option<String> {

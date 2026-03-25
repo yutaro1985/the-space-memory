@@ -279,7 +279,7 @@ mod tests {
     fn test_build_tag_links() {
         let conn = setup();
         let a = insert_doc(&conn, "a.md", Some(r#"["rust", "sqlite"]"#));
-        let b = insert_doc(&conn, "b.md", Some(r#"["rust", "search"]"#));
+        let _b = insert_doc(&conn, "b.md", Some(r#"["rust", "search"]"#));
         let _c = insert_doc(&conn, "c.md", Some(r#"["python"]"#));
 
         build_tag_links(&conn, a, &["rust".to_string(), "sqlite".to_string()]);

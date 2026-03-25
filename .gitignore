@@ -1,2 +1,9 @@
 .env
 .claude/settings.local.json
+
+# Rust
+/target/
+
+# Data & models
+/data/
+/models/

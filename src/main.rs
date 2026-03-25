@@ -21,7 +21,11 @@ impl From<DictFormatArg> for DictFormat {
 }
 
 #[derive(Parser)]
-#[command(name = "tsm", version, about = "The Space Memory — knowledge search engine")]
+#[command(
+    name = "tsm",
+    version,
+    about = "The Space Memory — knowledge search engine"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

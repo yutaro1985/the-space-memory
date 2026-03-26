@@ -17,7 +17,8 @@ SOCKET="/tmp/tsm-embedder.sock"
 
 # embedder デーモンが起動していなければバックグラウンドで起動
 if [ ! -S "$SOCKET" ]; then
-  "$TSM" embedder-start >/dev/null 2>&1 &
+  nohup "$TSM" embedder-start >/dev/null 2>&1 &
+  disown
   for _ in $(seq 1 50); do
     [ -S "$SOCKET" ] && break
     sleep 0.1

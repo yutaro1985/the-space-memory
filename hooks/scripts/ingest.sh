@@ -18,4 +18,4 @@ JSONL_FILE="$SESSIONS_DIR/$SESSION_ID.jsonl"
 
 [ ! -f "$JSONL_FILE" ] && exit 0
 
-"$TSM" ingest-session "$JSONL_FILE" >/dev/null 2>&1 &
+"$TSM" ingest-session "$JSONL_FILE" >/dev/null 2>&1

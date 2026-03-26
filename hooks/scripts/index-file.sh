@@ -19,4 +19,4 @@ REL_PATH="${FILE#/workspaces/}"
 # 相対パスに変換できなかった場合（/workspaces 以外のパス）はスキップ
 [ "$REL_PATH" = "$FILE" ] && exit 0
 
-echo "$REL_PATH" | "$TSM" index --files-from-stdin >/dev/null 2>&1 &
+echo "$REL_PATH" | "$TSM" index --files-from-stdin >/dev/null 2>&1

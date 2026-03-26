@@ -14,6 +14,9 @@ pub const MAX_QUERY_EXPANSIONS: usize = 5;
 pub const RECENT_DAYS: i64 = 30;
 pub const EMBEDDER_IDLE_TIMEOUT_SECS: u64 = 600;
 pub const DICT_CANDIDATE_FREQ_THRESHOLD: i64 = 5;
+pub const WORKER_ENCODE_TIMEOUT_PER_ITEM_SECS: u64 = 5;
+pub const WORKER_ENCODE_TIMEOUT_BASE_SECS: u64 = 10;
+pub const MAX_WORKER_RESTARTS: usize = 3;
 
 const DEFAULT_PROJECT_ROOT: &str = "/workspaces";
 const DEFAULT_DB_NAME: &str = "tsm.db";

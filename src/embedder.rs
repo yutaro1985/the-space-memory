@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -207,27 +208,15 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
     let embedder = Embedder::load(&Device::Cpu)?;
     eprintln!("Model loaded.");
 
-    // Backfill missing vectors before accepting connections
+    // Backfill via worker subprocess in background (crash-isolated)
     {
         let db_path = crate::config::db_path();
         if db_path.exists() {
-            match crate::db::get_connection(&db_path) {
-                Ok(conn) => {
-                    let encode = |texts: &[String]| embedder.encode(texts);
-                    match crate::indexer::backfill_vectors(
-                        &conn,
-                        &encode,
-                        crate::indexer::BACKFILL_BATCH_SIZE,
-                    ) {
-                        Ok(stats) if stats.filled > 0 => {
-                            eprintln!("Backfilled {} vectors.", stats.filled);
-                        }
-                        Err(e) => eprintln!("Backfill warning: {e}"),
-                        _ => {}
-                    }
+            std::thread::spawn(move || {
+                if let Err(e) = crate::cli::backfill_with_worker(&db_path) {
+                    eprintln!("Backfill warning: {e}");
                 }
-                Err(e) => eprintln!("Backfill warning: could not open DB: {e}"),
-            }
+            });
         }
     }
 
@@ -382,6 +371,195 @@ pub fn embed_via_socket_at(socket_path: &Path, texts: &[String]) -> Option<Vec<V
         .collect();
 
     Some(result)
+}
+
+// ─── Worker subprocess ──────────────────────────────────────────────
+
+/// Handle to a backfill-worker child process.
+/// The child loads the model once and processes encode requests via stdin/stdout pipes.
+/// If the child segfaults, the parent survives and can spawn a new worker.
+pub struct WorkerHandle {
+    child: Child,
+    stdin: std::process::ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+}
+
+impl WorkerHandle {
+    /// Spawn a new `tsm backfill-worker` child process.
+    /// Blocks until the child reports "READY" on stderr (with timeout).
+    pub fn spawn(timeout: Duration) -> Result<Self> {
+        let exe = std::env::current_exe().context("cannot determine executable path")?;
+        let mut child = Command::new(exe)
+            .arg("backfill-worker")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to spawn backfill-worker")?;
+
+        let stdin = child.stdin.take().context("no stdin")?;
+        let stdout = BufReader::new(child.stdout.take().context("no stdout")?);
+        let mut stderr = BufReader::new(child.stderr.take().context("no stderr")?);
+
+        // Wait for READY signal on stderr
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match stderr.read_line(&mut line) {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        eprint!("[worker] {line}");
+                        if line.trim() == "READY" {
+                            let _ = tx.send(true);
+                            // Continue forwarding stderr
+                            loop {
+                                line.clear();
+                                match stderr.read_line(&mut line) {
+                                    Ok(0) => break,
+                                    Ok(_) => eprint!("[worker] {line}"),
+                                    Err(_) => break,
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        rx.recv_timeout(timeout)
+            .map_err(|_| anyhow::anyhow!("backfill-worker did not become ready within {timeout:?}"))?;
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+        })
+    }
+
+    /// Send texts and receive embeddings via the pipe protocol.
+    /// Returns Err on timeout or if the child has died.
+    pub fn encode(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let request = serde_json::json!({ "texts": texts });
+        let request_bytes = serde_json::to_vec(&request)?;
+        write_message(&mut self.stdin, &request_bytes)?;
+
+        // Read response — blocking read on pipe.
+        // If the child crashes, read_message returns Err (broken pipe).
+        let response_data = read_message(&mut self.stdout)
+            .context("worker pipe read error (child may have crashed)")?;
+
+        let response: serde_json::Value = serde_json::from_slice(&response_data)?;
+
+        if let Some(err) = response.get("error").and_then(|e| e.as_str()) {
+            anyhow::bail!("worker encode error: {err}");
+        }
+
+        let embeddings = response
+            .get("embeddings")
+            .and_then(|v| v.as_array())
+            .context("missing embeddings in worker response")?;
+
+        let result: Vec<Vec<f32>> = embeddings
+            .iter()
+            .filter_map(|row| {
+                row.as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_f64().map(|f| f as f32))
+                        .collect()
+                })
+            })
+            .collect();
+
+        Ok(result)
+    }
+
+    /// Check if the child process is still alive.
+    pub fn is_alive(&mut self) -> bool {
+        self.child.try_wait().ok().flatten().is_none()
+    }
+
+    /// Kill the child process and wait.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Entry point for the `tsm backfill-worker` subprocess.
+/// Loads the model, signals READY, then processes encode requests on stdin/stdout.
+pub fn run_backfill_worker() -> Result<()> {
+    eprintln!("Loading model...");
+    let embedder = Embedder::load(&Device::Cpu)?;
+    eprintln!("Model loaded.");
+    eprintln!("READY");
+
+    let mut stdin = std::io::stdin().lock();
+    let mut stdout = std::io::stdout().lock();
+
+    loop {
+        let request_data = match read_message(&mut stdin) {
+            Ok(data) => data,
+            Err(_) => break, // stdin closed — parent is done
+        };
+
+        let request: serde_json::Value = match serde_json::from_slice(&request_data) {
+            Ok(v) => v,
+            Err(e) => {
+                let err_resp = serde_json::json!({ "error": format!("invalid request: {e}") });
+                let err_bytes = serde_json::to_vec(&err_resp)?;
+                write_message(&mut stdout, &err_bytes)?;
+                continue;
+            }
+        };
+
+        let texts: Vec<String> = request
+            .get("texts")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let encode_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| embedder.encode(&texts)));
+
+        let response = match encode_result {
+            Ok(Ok(emb)) => serde_json::json!({ "embeddings": emb }),
+            Ok(Err(e)) => {
+                eprintln!("Encode error: {e}");
+                serde_json::json!({ "error": format!("{e}") })
+            }
+            Err(panic_info) => {
+                let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(&s) = panic_info.downcast_ref::<&str>() {
+                    s.to_string()
+                } else {
+                    "unknown panic".to_string()
+                };
+                eprintln!("PANIC in encode: {msg}");
+                serde_json::json!({ "error": format!("panic: {msg}") })
+            }
+        };
+
+        let response_bytes = serde_json::to_vec(&response)?;
+        write_message(&mut stdout, &response_bytes)?;
+    }
+
+    eprintln!("Worker exiting.");
+    Ok(())
 }
 
 #[cfg(test)]

@@ -108,6 +108,9 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Internal: backfill worker subprocess (do not call directly)
+    #[command(hide = true)]
+    BackfillWorker,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -146,6 +149,7 @@ fn main() -> anyhow::Result<()> {
         } => cli::cmd_dict_update(threshold, yes, format.into())?,
         Commands::Doctor => cli::cmd_doctor()?,
         Commands::Rebuild { force } => cli::cmd_rebuild(force)?,
+        Commands::BackfillWorker => cli::cmd_backfill_worker()?,
     }
     Ok(())
 }

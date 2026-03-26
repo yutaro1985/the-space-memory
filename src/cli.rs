@@ -231,25 +231,62 @@ pub fn cmd_embedder_start(socket_path: Option<&Path>) -> anyhow::Result<()> {
 }
 
 pub fn cmd_vector_fill(batch_size: usize) -> anyhow::Result<()> {
-    let socket = Path::new(config::SOCKET_PATH);
-    if !socket.exists() {
-        anyhow::bail!("Embedder is not running. Start it with `embedder-start` first.");
-    }
-
     let db_path = config::db_path();
-    let conn = db::get_connection(&db_path)?;
+    backfill_with_worker_sized(&db_path, batch_size)
+}
 
-    let encode_fn = |texts: &[String]| {
-        embedder::embed_via_socket(texts)
-            .ok_or_else(|| anyhow::anyhow!("Failed to get embeddings from daemon"))
-    };
+pub fn cmd_backfill_worker() -> anyhow::Result<()> {
+    embedder::run_backfill_worker()
+}
 
-    let stats = indexer::backfill_vectors(&conn, &encode_fn, batch_size)?;
-    if stats.filled == 0 && stats.errors == 0 {
-        eprintln!("No missing vectors.");
-    } else {
-        eprintln!("Done: {} filled, {} errors.", stats.filled, stats.errors);
+/// Run backfill via a worker subprocess with default batch size.
+pub fn backfill_with_worker(db_path: &Path) -> anyhow::Result<()> {
+    backfill_with_worker_sized(db_path, indexer::BACKFILL_BATCH_SIZE)
+}
+
+/// Run backfill via a worker subprocess with specified batch size.
+fn backfill_with_worker_sized(db_path: &Path, batch_size: usize) -> anyhow::Result<()> {
+    let conn = db::get_connection(db_path)?;
+    let worker = std::cell::RefCell::new(embedder::WorkerHandle::spawn(
+        std::time::Duration::from_secs(120),
+    )?);
+    let mut restarts = 0;
+
+    loop {
+        let encode_fn = |texts: &[String]| worker.borrow_mut().encode(texts);
+        let stats = indexer::backfill_vectors(&conn, &encode_fn, batch_size)?;
+
+        if stats.errors == 0 {
+            if stats.filled > 0 {
+                eprintln!("Backfilled {} vectors.", stats.filled);
+            } else {
+                eprintln!("No missing vectors.");
+            }
+            break;
+        }
+
+        // Worker may have crashed — check and restart
+        if !worker.borrow_mut().is_alive() {
+            if restarts >= config::MAX_WORKER_RESTARTS {
+                eprintln!(
+                    "Worker crashed {} times. {} errors remain.",
+                    restarts + 1,
+                    stats.errors
+                );
+                break;
+            }
+            restarts += 1;
+            eprintln!("Worker crashed. Restarting ({restarts}/{})...", config::MAX_WORKER_RESTARTS);
+            *worker.borrow_mut() =
+                embedder::WorkerHandle::spawn(std::time::Duration::from_secs(120))?;
+            // Next iteration will pick up remaining unchunked vectors
+        } else {
+            // Worker alive but had encode errors — don't retry
+            eprintln!("Done: {} filled, {} errors.", stats.filled, stats.errors);
+            break;
+        }
     }
+
     Ok(())
 }
 

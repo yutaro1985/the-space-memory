@@ -7,7 +7,7 @@ SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
 
 [ -z "$SESSION_ID" ] && exit 0
 
-TSM="${CLAUDE_PLUGIN_ROOT}/tsm"
+TSM="${CLAUDE_PLUGIN_ROOT:-}/tsm"
 [ ! -x "$TSM" ] && exit 0
 
 cd "${CLAUDE_PROJECT_DIR:-/workspaces/workspace}"

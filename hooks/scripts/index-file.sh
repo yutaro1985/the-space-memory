@@ -7,7 +7,7 @@ FILE=$(jq -r '.tool_input.file_path // empty') || exit 0
 # .md ファイルのみ対象
 [[ "$FILE" != *.md ]] && exit 0
 
-TSM="${CLAUDE_PLUGIN_ROOT}/tsm"
+TSM="${CLAUDE_PLUGIN_ROOT:-}/tsm"
 [ ! -x "$TSM" ] && exit 0
 
 cd "${CLAUDE_PROJECT_DIR:-/workspaces/workspace}"

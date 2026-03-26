@@ -8,7 +8,7 @@ QUERY=$(echo "$INPUT" | jq -r '.user_prompt // empty' 2>/dev/null)
 # クエリが短すぎる場合はスキップ
 [ ${#QUERY} -lt 3 ] && exit 0
 
-TSM="${CLAUDE_PLUGIN_ROOT}/tsm"
+TSM="${CLAUDE_PLUGIN_ROOT:-}/tsm"
 [ ! -x "$TSM" ] && exit 0
 
 cd "${CLAUDE_PROJECT_DIR:-/workspaces/workspace}"

@@ -246,15 +246,41 @@ pub fn backfill_with_worker(db_path: &Path) -> anyhow::Result<()> {
 
 /// Run backfill via a worker subprocess with specified batch size.
 fn backfill_with_worker_sized(db_path: &Path, batch_size: usize) -> anyhow::Result<()> {
+    use crate::status;
+
     let conn = db::get_connection(db_path)?;
     let worker = std::cell::RefCell::new(embedder::WorkerHandle::spawn(
         std::time::Duration::from_secs(120),
     )?);
     let mut restarts = 0;
+    let data_dir = config::data_dir();
+    let started_at = chrono::Utc::now().to_rfc3339();
+
+    // Write initial backfill status
+    let started_at_clone = started_at.clone();
+    status::update(&data_dir, |s| {
+        s.backfill = Some(status::BackfillStatus {
+            total: 0,
+            filled: 0,
+            errors: 0,
+            started_at: started_at_clone,
+        });
+    });
+
+    let progress_cb = |total: i64, filled: usize, errors: usize| {
+        status::update(&data_dir, |s| {
+            if let Some(ref mut b) = s.backfill {
+                b.total = total;
+                b.filled = filled;
+                b.errors = errors;
+            }
+        });
+    };
 
     loop {
         let encode_fn = |texts: &[String]| worker.borrow_mut().encode(texts);
-        let stats = indexer::backfill_vectors(&conn, &encode_fn, batch_size)?;
+        let stats =
+            indexer::backfill_vectors(&conn, &encode_fn, batch_size, Some(&progress_cb))?;
 
         if stats.errors == 0 {
             if stats.filled > 0 {
@@ -289,6 +315,11 @@ fn backfill_with_worker_sized(db_path: &Path, batch_size: usize) -> anyhow::Resu
             break;
         }
     }
+
+    // Clear backfill status on completion
+    status::update(&data_dir, |s| {
+        s.backfill = None;
+    });
 
     Ok(())
 }
@@ -430,6 +461,114 @@ pub fn cmd_doctor() -> anyhow::Result<()> {
         println!("\nAll good.");
     }
     Ok(())
+}
+
+pub fn cmd_status() -> anyhow::Result<()> {
+    use crate::status;
+
+    let data_dir = config::data_dir();
+    let db_path = config::db_path();
+    let sf = status::read(&data_dir);
+
+    println!("=== The Space Memory Status ===\n");
+
+    // Embedder
+    let socket = std::path::Path::new(config::SOCKET_PATH);
+    if socket.exists() {
+        if let Some(ref emb) = sf.embedder {
+            let since = format_since(&emb.started_at);
+            println!("  Embedder:  running (since {since}, PID {})", emb.pid);
+        } else {
+            println!("  Embedder:  running");
+        }
+    } else {
+        println!("  Embedder:  stopped");
+    }
+
+    // Backfill
+    if let Some(ref bf) = sf.backfill {
+        let pct = if bf.total > 0 {
+            (bf.filled as f64 / bf.total as f64 * 100.0) as u32
+        } else {
+            0
+        };
+        let since = format_since(&bf.started_at);
+        let processed = bf.filled + bf.errors;
+        let eta = if processed > 0 && bf.total > 0 {
+            estimate_eta(&bf.started_at, processed, bf.total as usize)
+        } else {
+            "calculating...".to_string()
+        };
+        println!(
+            "  Backfill:  {}/{} ({pct}%) — running since {since}, ETA {eta}",
+            bf.filled, bf.total
+        );
+        if bf.errors > 0 {
+            println!("             {} errors", bf.errors);
+        }
+    } else {
+        println!("  Backfill:  idle");
+    }
+
+    // DB stats
+    if let Ok(conn) = db::get_connection(&db_path) {
+        let docs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+            .unwrap_or(0);
+        let chunks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap_or(0);
+        let vecs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        println!("  Documents: {docs}");
+        println!("  Chunks:    {chunks}");
+        if chunks > 0 {
+            let pct = (vecs as f64 / chunks as f64 * 100.0) as u32;
+            println!("  Vectors:   {vecs}/{chunks} ({pct}%)");
+        } else {
+            println!("  Vectors:   0");
+        }
+
+        if db::has_candidates_table(&conn) {
+            let summary = user_dict::candidate_summary(&conn);
+            if summary.ready_count > 0 {
+                println!("  Dict:      {} candidates ready", summary.ready_count);
+            } else {
+                println!("  Dict:      no candidates ready");
+            }
+        }
+    } else {
+        println!("  DB:        not found");
+    }
+
+    Ok(())
+}
+
+fn format_since(rfc3339: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|dt| dt.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|_| rfc3339.to_string())
+}
+
+fn estimate_eta(started_at: &str, processed: usize, total: usize) -> String {
+    let Ok(start) = chrono::DateTime::parse_from_rfc3339(started_at) else {
+        return "unknown".to_string();
+    };
+    let elapsed = chrono::Utc::now().signed_duration_since(start);
+    let elapsed_secs = elapsed.num_seconds() as f64;
+    if elapsed_secs <= 0.0 || processed == 0 {
+        return "calculating...".to_string();
+    }
+    let remaining = total.saturating_sub(processed);
+    let rate = processed as f64 / elapsed_secs;
+    let eta_secs = (remaining as f64 / rate) as i64;
+    if eta_secs < 60 {
+        format!("~{eta_secs}s")
+    } else {
+        format!("~{}m", eta_secs / 60)
+    }
 }
 
 pub fn cmd_dict_update(

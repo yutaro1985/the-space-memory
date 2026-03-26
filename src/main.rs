@@ -100,6 +100,8 @@ enum Commands {
         #[arg(long, value_enum, default_value = "ipadic")]
         format: DictFormatArg,
     },
+    /// Show current system status
+    Status,
     /// Check system health
     Doctor,
     /// Rebuild database (backup, delete, init, full index)
@@ -147,6 +149,7 @@ fn main() -> anyhow::Result<()> {
             yes,
             format,
         } => cli::cmd_dict_update(threshold, yes, format.into())?,
+        Commands::Status => cli::cmd_status()?,
         Commands::Doctor => cli::cmd_doctor()?,
         Commands::Rebuild { force } => cli::cmd_rebuild(force)?,
         Commands::BackfillWorker => cli::cmd_backfill_worker()?,

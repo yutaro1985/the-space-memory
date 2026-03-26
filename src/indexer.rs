@@ -420,6 +420,7 @@ pub fn backfill_vectors(
     conn: &Connection,
     encode_fn: EncodeFn,
     batch_size: usize,
+    progress_cb: Option<&dyn Fn(i64, usize, usize)>,
 ) -> anyhow::Result<BackfillStats> {
     if !db::has_vec_table(conn) {
         return Ok(BackfillStats::default());
@@ -441,6 +442,9 @@ pub fn backfill_vectors(
     }
 
     eprintln!("Backfilling {total} chunks...");
+    if let Some(cb) = &progress_cb {
+        cb(total, 0, 0);
+    }
     let mut stats = BackfillStats::default();
     let mut last_id: i64 = 0;
 
@@ -505,6 +509,10 @@ pub fn backfill_vectors(
 
         let processed = stats.filled + stats.errors;
         eprintln!("  {processed}/{total}");
+
+        if let Some(cb) = &progress_cb {
+            cb(total, stats.filled, stats.errors);
+        }
     }
 
     if stats.panics > 0 {
@@ -693,7 +701,7 @@ mod tests {
     #[test]
     fn test_backfill_no_missing() {
         let conn = db::get_memory_connection().unwrap();
-        let stats = backfill_vectors(&conn, &mock_encode, BACKFILL_BATCH_SIZE).unwrap();
+        let stats = backfill_vectors(&conn, &mock_encode, BACKFILL_BATCH_SIZE, None).unwrap();
         assert_eq!(stats.filled, 0);
         assert_eq!(stats.errors, 0);
     }
@@ -720,7 +728,7 @@ mod tests {
         assert_eq!(vecs_before, 0);
 
         // Backfill
-        let stats = backfill_vectors(&conn, &mock_encode, BACKFILL_BATCH_SIZE).unwrap();
+        let stats = backfill_vectors(&conn, &mock_encode, BACKFILL_BATCH_SIZE, None).unwrap();
         assert_eq!(stats.filled as i64, chunks);
         assert_eq!(stats.errors, 0);
 
@@ -736,11 +744,11 @@ mod tests {
         let path = write_md(dir.path(), "daily/notes/test.md", "# Hello\n\nContent.\n");
         index_file(&conn, &path, dir.path()).unwrap();
 
-        let stats1 = backfill_vectors(&conn, &mock_encode, BACKFILL_BATCH_SIZE).unwrap();
+        let stats1 = backfill_vectors(&conn, &mock_encode, BACKFILL_BATCH_SIZE, None).unwrap();
         assert!(stats1.filled > 0);
 
         // Second run should find nothing to fill
-        let stats2 = backfill_vectors(&conn, &mock_encode, BACKFILL_BATCH_SIZE).unwrap();
+        let stats2 = backfill_vectors(&conn, &mock_encode, BACKFILL_BATCH_SIZE, None).unwrap();
         assert_eq!(stats2.filled, 0);
         assert_eq!(stats2.errors, 0);
     }
@@ -761,7 +769,7 @@ mod tests {
         assert!(chunks >= 5);
 
         // Use batch_size=2 to force multiple batches
-        let stats = backfill_vectors(&conn, &mock_encode, 2).unwrap();
+        let stats = backfill_vectors(&conn, &mock_encode, 2, None).unwrap();
         assert_eq!(stats.filled as i64, chunks);
 
         let vecs: i64 = conn
@@ -776,7 +784,7 @@ mod tests {
         let path = write_md(dir.path(), "daily/notes/test.md", "# Hello\n\nContent.\n");
         index_file(&conn, &path, dir.path()).unwrap();
 
-        let stats = backfill_vectors(&conn, &mock_encode_fail, BACKFILL_BATCH_SIZE).unwrap();
+        let stats = backfill_vectors(&conn, &mock_encode_fail, BACKFILL_BATCH_SIZE, None).unwrap();
         assert_eq!(stats.filled, 0);
         assert!(stats.errors > 0);
     }
@@ -791,7 +799,7 @@ mod tests {
         let path = write_md(dir.path(), "daily/notes/test.md", "# Hello\n\nContent.\n");
         index_file(&conn, &path, dir.path()).unwrap();
 
-        let stats = backfill_vectors(&conn, &mock_encode_panic, BACKFILL_BATCH_SIZE).unwrap();
+        let stats = backfill_vectors(&conn, &mock_encode_panic, BACKFILL_BATCH_SIZE, None).unwrap();
         assert_eq!(stats.filled, 0);
         assert!(stats.panics > 0, "should have caught a panic");
         assert!(stats.errors > 0, "panics should count as errors too");
@@ -817,7 +825,7 @@ mod tests {
         };
 
         // batch_size=1 so each chunk is its own batch
-        let stats = backfill_vectors(&conn, &panic_on_first, 1).unwrap();
+        let stats = backfill_vectors(&conn, &panic_on_first, 1, None).unwrap();
         assert!(stats.panics > 0, "should have caught at least 1 panic");
         assert!(
             stats.filled > 0,

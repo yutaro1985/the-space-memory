@@ -10,6 +10,7 @@ pub mod frontmatter;
 pub mod indexer;
 pub mod searcher;
 pub mod session_chunker;
+pub mod status;
 pub mod synonyms;
 pub mod temporal;
 pub mod tokenizer;

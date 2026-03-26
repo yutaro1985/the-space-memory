@@ -221,6 +221,14 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
         }
     }
 
+    // Write embedder status
+    crate::status::update(&crate::config::data_dir(), |s| {
+        s.embedder = Some(crate::status::EmbedderStatus {
+            started_at: chrono::Utc::now().to_rfc3339(),
+            pid: std::process::id(),
+        });
+    });
+
     eprintln!("Listening on {}", socket_path.display());
 
     let listener = UnixListener::bind(socket_path)?;
@@ -260,6 +268,9 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
     }
 
     eprintln!("Shutting down (idle timeout).");
+    crate::status::update(&crate::config::data_dir(), |s| {
+        s.embedder = None;
+    });
     let _ = std::fs::remove_file(socket_path);
     Ok(())
 }

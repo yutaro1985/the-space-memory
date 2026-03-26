@@ -1,13 +1,40 @@
 ---
-description: Search the knowledge base with a query
+description: "全ワークスペース横断のナレッジ検索。過去のノート・調査・ナレッジをベクトル＋全文のハイブリッド検索で探す。「検索して」「調べて」「調査して」「どこにある？」「〜ある？」「〜あったっけ？」「前に調べた〜」「〜についてナレッジある？」のような依頼で使う。ユーザーが過去の情報を探している・思い出そうとしている場合は積極的にトリガーすること。"
 user-invocable: true
-disable-model-invocation: true
 ---
 
 # Search
 
-```bash
-cd "${CLAUDE_PROJECT_DIR:-/workspaces/workspace}" \
-  && ${CLAUDE_PLUGIN_ROOT}/tsm search -q "$ARGUMENTS" \
-  -k 5 -f json --include-content 3
-```
+## 検索結果
+
+!`cd /workspaces/workspace && /workspaces/the-space-memory/tsm search -q "$ARGUMENTS" -k 5 -f json --include-content 3 2>/dev/null || echo "[]"`
+
+## 結果の処理方法
+
+上記の検索結果を以下のルールで処理してユーザーに返すこと。
+
+### クエリ分解（検索前）
+
+重要: **会話的なプロンプトをそのまま検索クエリにしない**。
+「〜調べて」「〜ある？」「〜っぽいんだけど」等のノイズを除去し、キーワードを抽出すること。
+
+複数トピックがある場合は、このコマンドを複数回呼び出す:
+- トピック分割: 「射撃とマイクロファクトリー」 → 2回に分けて検索
+- 観点分割: 「LoRaの山間部での活用」 → 「LoRa 通信 山間部」と「LoRa IoT 実装」
+- 言語分割: 日本語ドキュメントと英語ドキュメントがあるなら両方で検索
+
+### 回答フォーマット
+
+- ソースファイルのパスを必ず引用する
+- `status: outdated` の情報はその旨を明記する
+- 検索でヒットしなかった場合は正直に「見つからなかった」と伝える
+- 結果が多い場合はスコア順に重要なものを優先する
+
+### 深掘り
+
+snippet が不十分な場合は `source_file` のパスを Read で読んで補完する（最大3ファイル）。
+
+### 詳細調査モード
+
+ユーザーが深い調査を求めている場合（「詳しく」「徹底的に」「全部洗い出して」等）、
+Agent ツール（subagent_type: `the-space-memory:deep-research`）に委任する。

@@ -1,4 +1,14 @@
 {
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+    "ENABLE_LSP_TOOL": "1",
+    "ENABLE_SESSION_BACKGROUNDING": "1",
+    "MCP_CONNECTION_NONBLOCKING": "1",
+    "ENABLE_BTW": "1",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet",
+    "CLAUDE_CODE_STREAMING_TEXT": "1",
+    "CLAUDE_CODE_ACTION": "auto"
+  },
   "hooks": {
     "PostToolUse": [
       {
@@ -25,10 +35,14 @@
     ]
   },
   "permissions": {
+    "defaultMode": "auto",
     "deny": [
       "Read(**.env*)",
       "Edit(**.env*)",
-      "Write(**.env*)"
+      "Write(**.env*)",
+      "Bash(rm -rf *)",
+      "Bash(git push --force*)",
+      "Bash(git reset --hard*)"
     ]
   },
   "attribution": {

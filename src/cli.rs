@@ -411,6 +411,43 @@ impl DoctorReport {
             .filter(|i| i.status != CheckStatus::Ok)
             .count()
     }
+
+    pub fn to_json(&self) -> String {
+        let sections: Vec<serde_json::Value> = self
+            .sections
+            .iter()
+            .map(|s| {
+                let items: Vec<serde_json::Value> = s
+                    .items
+                    .iter()
+                    .map(|i| {
+                        let mut obj = serde_json::json!({
+                            "status": match i.status {
+                                CheckStatus::Ok => "ok",
+                                CheckStatus::Warning => "warning",
+                                CheckStatus::Error => "error",
+                            },
+                            "message": i.message,
+                        });
+                        if let Some(hint) = &i.hint {
+                            obj["hint"] = serde_json::Value::String(hint.clone());
+                        }
+                        obj
+                    })
+                    .collect();
+                serde_json::json!({
+                    "name": s.name,
+                    "items": items,
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "sections": sections,
+            "issue_count": self.issue_count(),
+        })
+        .to_string()
+    }
 }
 
 pub fn doctor_check(db_path: &Path) -> DoctorReport {
@@ -557,10 +594,16 @@ pub fn doctor_check(db_path: &Path) -> DoctorReport {
     report
 }
 
-pub fn cmd_doctor() -> anyhow::Result<()> {
+pub fn cmd_doctor(format: &str) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let report = doctor_check(&db_path);
-    render_doctor_report(&report);
+    match format {
+        "json" => {
+            let json = report.to_json();
+            println!("{json}");
+        }
+        _ => render_doctor_report(&report),
+    }
     Ok(())
 }
 

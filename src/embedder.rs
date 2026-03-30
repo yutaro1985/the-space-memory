@@ -17,7 +17,6 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
 use crate::config;
 
 const MODEL_ID: &str = "cl-nagoya/ruri-v3-30m";
-use crate::config::EMBEDDER_IDLE_TIMEOUT_SECS as IDLE_TIMEOUT_SECS;
 
 /// The embedder engine: loads model and produces embeddings.
 pub struct Embedder {
@@ -237,14 +236,17 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let last_activity = Arc::new(std::sync::Mutex::new(Instant::now()));
 
-    // Watchdog thread
-    {
+    // Watchdog thread (skipped when idle timeout is 0)
+    let idle_timeout_secs = config::embedder_idle_timeout_secs();
+    if idle_timeout_secs > 0 {
         let running = Arc::clone(&running);
         let last_activity = Arc::clone(&last_activity);
         let socket_path = socket_path.to_path_buf();
         std::thread::spawn(move || {
-            watchdog(&running, &last_activity, &socket_path);
+            watchdog(&running, &last_activity, &socket_path, idle_timeout_secs);
         });
+    } else {
+        eprintln!("Idle timeout disabled.");
     }
 
     while running.load(Ordering::Relaxed) {
@@ -275,8 +277,13 @@ pub fn run_daemon(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn watchdog(running: &AtomicBool, last_activity: &std::sync::Mutex<Instant>, socket_path: &Path) {
-    let timeout = Duration::from_secs(IDLE_TIMEOUT_SECS);
+fn watchdog(
+    running: &AtomicBool,
+    last_activity: &std::sync::Mutex<Instant>,
+    socket_path: &Path,
+    timeout_secs: u64,
+) {
+    let timeout = Duration::from_secs(timeout_secs);
     loop {
         std::thread::sleep(Duration::from_secs(10));
         if !running.load(Ordering::Relaxed) {
@@ -284,7 +291,7 @@ fn watchdog(running: &AtomicBool, last_activity: &std::sync::Mutex<Instant>, soc
         }
         let elapsed = last_activity.lock().unwrap().elapsed();
         if elapsed >= timeout {
-            eprintln!("Idle timeout reached ({IDLE_TIMEOUT_SECS}s). Stopping.");
+            eprintln!("Idle timeout reached ({timeout_secs}s). Stopping.");
             running.store(false, Ordering::Relaxed);
             // Poke the listener to unblock accept
             let _ = UnixStream::connect(socket_path);

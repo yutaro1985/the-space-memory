@@ -13,6 +13,22 @@ pub const BACKFILL_BATCH_SIZE: usize = 8;
 pub const MAX_QUERY_EXPANSIONS: usize = 5;
 pub const RECENT_DAYS: i64 = 30;
 pub const EMBEDDER_IDLE_TIMEOUT_SECS: u64 = 600;
+
+/// Load embedder idle timeout from config.
+/// TSM_EMBEDDER_IDLE_TIMEOUT env > config file > default (600s). 0 = disable.
+pub fn embedder_idle_timeout_secs() -> u64 {
+    if let Ok(val) = std::env::var("TSM_EMBEDDER_IDLE_TIMEOUT") {
+        if let Ok(n) = val.parse::<u64>() {
+            return n;
+        }
+    }
+    if let Some(val) = load_config_value("embedder_idle_timeout_secs") {
+        if let Ok(n) = val.parse::<u64>() {
+            return n;
+        }
+    }
+    EMBEDDER_IDLE_TIMEOUT_SECS
+}
 pub const DICT_CANDIDATE_FREQ_THRESHOLD: i64 = 5;
 pub const WORKER_ENCODE_TIMEOUT_PER_ITEM_SECS: u64 = 5;
 pub const WORKER_ENCODE_TIMEOUT_BASE_SECS: u64 = 10;
@@ -269,6 +285,30 @@ mod tests {
     #[test]
     fn test_dict_candidate_freq_threshold() {
         assert_eq!(DICT_CANDIDATE_FREQ_THRESHOLD, 5);
+    }
+
+    #[test]
+    fn test_embedder_idle_timeout_default() {
+        std::env::remove_var("TSM_EMBEDDER_IDLE_TIMEOUT");
+        std::env::remove_var("TSM_CONFIG");
+        let timeout = embedder_idle_timeout_secs();
+        assert_eq!(timeout, EMBEDDER_IDLE_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn test_embedder_idle_timeout_env() {
+        std::env::set_var("TSM_EMBEDDER_IDLE_TIMEOUT", "0");
+        let timeout = embedder_idle_timeout_secs();
+        assert_eq!(timeout, 0);
+        std::env::remove_var("TSM_EMBEDDER_IDLE_TIMEOUT");
+    }
+
+    #[test]
+    fn test_embedder_idle_timeout_env_custom() {
+        std::env::set_var("TSM_EMBEDDER_IDLE_TIMEOUT", "3600");
+        let timeout = embedder_idle_timeout_secs();
+        assert_eq!(timeout, 3600);
+        std::env::remove_var("TSM_EMBEDDER_IDLE_TIMEOUT");
     }
 
     #[test]

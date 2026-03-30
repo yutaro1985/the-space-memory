@@ -103,7 +103,11 @@ enum Commands {
     /// Show current system status
     Status,
     /// Check system health
-    Doctor,
+    Doctor {
+        /// Output format: text (default) or json
+        #[arg(short, long, default_value = "text")]
+        format: String,
+    },
     /// Rebuild database (backup, delete, init, full index)
     Rebuild {
         /// Proceed without confirmation
@@ -150,7 +154,7 @@ fn main() -> anyhow::Result<()> {
             format,
         } => cli::cmd_dict_update(threshold, yes, format.into())?,
         Commands::Status => cli::cmd_status()?,
-        Commands::Doctor => cli::cmd_doctor()?,
+        Commands::Doctor { format } => cli::cmd_doctor(&format)?,
         Commands::Rebuild { force } => cli::cmd_rebuild(force)?,
         Commands::BackfillWorker => cli::cmd_backfill_worker()?,
     }

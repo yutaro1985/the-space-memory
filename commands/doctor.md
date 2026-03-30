@@ -2,6 +2,7 @@
 description: Run tsm health check
 user-invocable: true
 disable-model-invocation: true
+allowed-tools: Bash(tsm *)
 ---
 
 # Doctor
@@ -14,6 +15,4 @@ disable-model-invocation: true
 - status が "error" のアイテムは ✘ を付けて hint を添える
 - issue_count が 0 なら「All good.」、それ以外は issue 数を表示
 
-```json
-!`cd "${CLAUDE_PROJECT_DIR:-/workspaces/workspace}" && ${CLAUDE_PLUGIN_ROOT}/tsm doctor -f json 2>/dev/null`
-```
+!`tsm doctor -f json 2>/dev/null`

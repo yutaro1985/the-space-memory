@@ -173,7 +173,7 @@ fn main() -> anyhow::Result<()> {
                 year,
             };
             if let Some(resp) = try_daemon(&req) {
-                render_search(resp, &format);
+                render_search(resp, &format)?;
             } else {
                 cli::cmd_search(cli::SearchOptions {
                     query: &query,
@@ -193,7 +193,7 @@ fn main() -> anyhow::Result<()> {
                 // Full index — try daemon first
                 let req = DaemonRequest::Index { files: vec![] };
                 if let Some(resp) = try_daemon(&req) {
-                    render_index(resp);
+                    render_index(resp)?;
                 } else {
                     cli::cmd_index(false)?;
                 }
@@ -207,11 +207,9 @@ fn main() -> anyhow::Result<()> {
                     .map(|p| p.to_string_lossy().to_string())
                     .collect();
 
-                let req = DaemonRequest::Index {
-                    files: rel_paths.clone(),
-                };
+                let req = DaemonRequest::Index { files: rel_paths };
                 if let Some(resp) = try_daemon(&req) {
-                    render_index(resp);
+                    render_index(resp)?;
                 } else {
                     let stats = cli::run_index(
                         &the_space_memory::db::get_connection(&config::db_path())?,
@@ -231,7 +229,7 @@ fn main() -> anyhow::Result<()> {
                 session_file: session_file.to_string_lossy().to_string(),
             };
             if let Some(resp) = try_daemon(&req) {
-                render_ingest(resp, &session_file);
+                render_ingest(resp, &session_file)?;
             } else {
                 cli::cmd_ingest_session(&session_file)?;
             }
@@ -240,7 +238,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Status => {
             let req = DaemonRequest::Status;
             if let Some(resp) = try_daemon(&req) {
-                render_status(resp);
+                render_status(resp)?;
             } else {
                 cli::cmd_status()?;
             }
@@ -251,7 +249,7 @@ fn main() -> anyhow::Result<()> {
                 format: format.clone(),
             };
             if let Some(resp) = try_daemon(&req) {
-                render_doctor(resp, &format);
+                render_doctor(resp, &format)?;
             } else {
                 cli::cmd_doctor(&format)?;
             }
@@ -262,13 +260,12 @@ fn main() -> anyhow::Result<()> {
                 wordnet_db: wordnet_db.to_string_lossy().to_string(),
             };
             if let Some(resp) = try_daemon(&req) {
-                if resp.ok {
-                    if let Some(payload) = resp.payload {
-                        let count = payload["imported"].as_i64().unwrap_or(0);
-                        eprintln!("Imported {count} synonym pairs from WordNet.");
-                    }
-                } else {
-                    eprintln!("error: {}", resp.error.unwrap_or_default());
+                if !resp.ok {
+                    anyhow::bail!("{}", resp.error.unwrap_or_default());
+                }
+                if let Some(payload) = resp.payload {
+                    let count = payload["imported"].as_i64().unwrap_or(0);
+                    eprintln!("Imported {count} synonym pairs from WordNet.");
                 }
             } else {
                 cli::cmd_import_wordnet(&wordnet_db)?;
@@ -308,10 +305,9 @@ fn guard_daemon_not_running(command: &str) -> anyhow::Result<()> {
 
 // ─── Render helpers (daemon response → terminal output) ───────────
 
-fn render_search(resp: DaemonResponse, format: &str) {
+fn render_search(resp: DaemonResponse, format: &str) -> anyhow::Result<()> {
     if !resp.ok {
-        eprintln!("error: {}", resp.error.unwrap_or_default());
-        return;
+        anyhow::bail!("{}", resp.error.unwrap_or_default());
     }
     let payload = resp.payload.unwrap_or_default();
     match format {
@@ -327,12 +323,12 @@ fn render_search(resp: DaemonResponse, format: &str) {
             print!("{}", cli::format_text(&results));
         }
     }
+    Ok(())
 }
 
-fn render_index(resp: DaemonResponse) {
+fn render_index(resp: DaemonResponse) -> anyhow::Result<()> {
     if !resp.ok {
-        eprintln!("error: {}", resp.error.unwrap_or_default());
-        return;
+        anyhow::bail!("{}", resp.error.unwrap_or_default());
     }
     if let Some(payload) = resp.payload {
         let indexed = payload["indexed"].as_i64().unwrap_or(0);
@@ -340,17 +336,17 @@ fn render_index(resp: DaemonResponse) {
         let removed = payload["removed"].as_i64().unwrap_or(0);
         eprintln!("Indexed: {indexed}, Skipped: {skipped}, Removed: {removed}");
     }
+    Ok(())
 }
 
-fn render_ingest(resp: DaemonResponse, session_file: &std::path::Path) {
+fn render_ingest(resp: DaemonResponse, session_file: &std::path::Path) -> anyhow::Result<()> {
+    if !resp.ok {
+        anyhow::bail!("{}", resp.error.unwrap_or_default());
+    }
     let name = session_file
         .file_name()
         .unwrap_or_default()
         .to_string_lossy();
-    if !resp.ok {
-        eprintln!("error: {}", resp.error.unwrap_or_default());
-        return;
-    }
     if let Some(payload) = resp.payload {
         if payload["indexed"].as_bool().unwrap_or(false) {
             eprintln!("Session indexed: {name}");
@@ -358,12 +354,12 @@ fn render_ingest(resp: DaemonResponse, session_file: &std::path::Path) {
             eprintln!("Session unchanged: {name}");
         }
     }
+    Ok(())
 }
 
-fn render_status(resp: DaemonResponse) {
+fn render_status(resp: DaemonResponse) -> anyhow::Result<()> {
     if !resp.ok {
-        eprintln!("error: {}", resp.error.unwrap_or_default());
-        return;
+        anyhow::bail!("{}", resp.error.unwrap_or_default());
     }
     if let Some(payload) = resp.payload {
         match serde_json::from_value::<cli::StatusInfo>(payload) {
@@ -371,12 +367,12 @@ fn render_status(resp: DaemonResponse) {
             Err(_) => eprintln!("(could not parse daemon status)"),
         }
     }
+    Ok(())
 }
 
-fn render_doctor(resp: DaemonResponse, format: &str) {
+fn render_doctor(resp: DaemonResponse, format: &str) -> anyhow::Result<()> {
     if !resp.ok {
-        eprintln!("error: {}", resp.error.unwrap_or_default());
-        return;
+        anyhow::bail!("{}", resp.error.unwrap_or_default());
     }
     let payload = resp.payload.unwrap_or_default();
     match format {
@@ -390,7 +386,6 @@ fn render_doctor(resp: DaemonResponse, format: &str) {
             match serde_json::from_value::<cli::DoctorReport>(payload.clone()) {
                 Ok(report) => cli::render_doctor_report(&report),
                 Err(_) => {
-                    // Fallback: print raw JSON
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&payload).unwrap_or_default()
@@ -399,6 +394,7 @@ fn render_doctor(resp: DaemonResponse, format: &str) {
             }
         }
     }
+    Ok(())
 }
 
 /// Start the tsmd daemon as a background process.

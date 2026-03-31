@@ -25,7 +25,7 @@ fi
 cd "${CLAUDE_PROJECT_DIR:-/workspaces/workspace}"
 
 # 検索実行（tsmd が未起動なら自動起動される）
-RESULT=$("$TSM" search --query "$QUERY" --format json 2>/dev/null) || {
+RESULT=$("$TSM" search --query "$QUERY" --format json 2>>"$LOG") || {
   echo "[$(date -Iseconds)] FAIL: tsm search exited with $?" >> "$LOG"
   exit 0
 }

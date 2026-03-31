@@ -388,11 +388,21 @@ fn cmd_start() -> anyhow::Result<()> {
         );
     }
 
-    // Spawn tsmd in a new session (detached)
+    // Spawn tsmd in a new session (detached), stderr to log file
+    let log_path = config::data_dir().join("tsmd.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .ok();
+    let stderr_cfg = match log_file {
+        Some(f) => std::process::Stdio::from(f),
+        None => std::process::Stdio::null(),
+    };
     let mut cmd = std::process::Command::new(&tsmd_path);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(stderr_cfg);
     unsafe {
         cmd.pre_exec(|| {
             libc::setsid();

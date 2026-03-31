@@ -191,7 +191,9 @@ fn start_embedder() -> Result<Child> {
 
     // Clean up stale embedder socket
     if embedder_socket.exists() {
-        let _ = std::fs::remove_file(embedder_socket);
+        if let Err(e) = std::fs::remove_file(embedder_socket) {
+            eprintln!("tsmd: warning: could not remove stale embedder socket: {e}");
+        }
     }
 
     // Find the tsm binary (same directory as tsmd)

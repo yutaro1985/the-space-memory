@@ -513,12 +513,30 @@ fn doctor_check_with_conn(
     report: &mut DoctorReport,
     mut db_section: DoctorSection,
 ) {
-    let docs: i64 = conn
-        .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
-        .unwrap_or(0);
-    let chunks: i64 = conn
-        .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
-        .unwrap_or(0);
+    let docs: i64 = match conn.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0)) {
+        Ok(n) => n,
+        Err(e) => {
+            db_section.items.push(CheckItem {
+                status: CheckStatus::Error,
+                message: format!("Failed to query documents: {e}"),
+                hint: Some("Run `init` to initialize the database.".to_string()),
+            });
+            report.sections.push(db_section);
+            return;
+        }
+    };
+    let chunks: i64 = match conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0)) {
+        Ok(n) => n,
+        Err(e) => {
+            db_section.items.push(CheckItem {
+                status: CheckStatus::Error,
+                message: format!("Failed to query chunks: {e}"),
+                hint: Some("Run `init` to initialize the database.".to_string()),
+            });
+            report.sections.push(db_section);
+            return;
+        }
+    };
     db_section.items.push(CheckItem {
         status: CheckStatus::Ok,
         message: format!("Documents: {docs}"),

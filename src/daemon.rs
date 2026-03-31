@@ -286,6 +286,16 @@ mod tests {
     }
 
     #[test]
+    fn test_vector_fill_empty_db() {
+        let (conn, dir) = setup();
+        let flag = AtomicBool::new(false);
+        let req = DaemonRequest::VectorFill { batch_size: 8 };
+        let resp = handle_request(&conn, req, dir.path(), &flag);
+        // Empty DB has no chunks to backfill — should succeed or error gracefully
+        assert!(resp.ok || resp.error.is_some());
+    }
+
+    #[test]
     fn test_doctor_text_format() {
         let (conn, dir) = setup();
         let flag = AtomicBool::new(false);

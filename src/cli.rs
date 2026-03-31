@@ -15,6 +15,15 @@ pub fn cmd_init() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run indexing on given file paths and return stats (no DB open, no output).
+pub fn run_index(
+    conn: &rusqlite::Connection,
+    file_paths: &[PathBuf],
+    project_root: &Path,
+) -> anyhow::Result<indexer::IndexStats> {
+    indexer::index_all(conn, file_paths, project_root)
+}
+
 pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let conn = db::get_connection(&db_path)?;
@@ -26,7 +35,7 @@ pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
         collect_content_files(&project_root)
     };
 
-    let stats = indexer::index_all(&conn, &file_paths, &project_root)?;
+    let stats = run_index(&conn, &file_paths, &project_root)?;
     eprintln!(
         "Indexed: {}, Skipped: {}, Removed: {}",
         stats.indexed, stats.skipped, stats.removed
@@ -82,13 +91,13 @@ pub struct SearchOptions<'a> {
     pub year: Option<i32>,
 }
 
-pub fn cmd_search(opts: SearchOptions) -> anyhow::Result<()> {
+/// Run search and return structured results (no DB open, no output).
+pub fn run_search(
+    conn: &rusqlite::Connection,
+    opts: &SearchOptions,
+) -> anyhow::Result<Vec<searcher::SearchResult>> {
     use crate::temporal;
 
-    let db_path = config::db_path();
-    let conn = db::get_connection(&db_path)?;
-
-    // Extract temporal expressions from query, then merge with CLI args
     let parsed = temporal::parse_temporal(opts.query);
     let filter = temporal::merge_filters(
         opts.after,
@@ -97,11 +106,15 @@ pub fn cmd_search(opts: SearchOptions) -> anyhow::Result<()> {
         opts.year,
         parsed.filter,
     )?;
-
-    // Always use cleaned query (temporal expressions removed)
     let search_query = &parsed.query;
+    searcher::search(conn, search_query, opts.top_k, filter.as_ref())
+}
 
-    let results = searcher::search(&conn, search_query, opts.top_k, filter.as_ref())?;
+pub fn cmd_search(opts: SearchOptions) -> anyhow::Result<()> {
+    let db_path = config::db_path();
+    let conn = db::get_connection(&db_path)?;
+
+    let results = run_search(&conn, &opts)?;
     match opts.format {
         "json" => print_json(&results, opts.include_content)?,
         _ => print_text(&results),
@@ -199,28 +212,29 @@ fn print_json(
     Ok(())
 }
 
-pub fn cmd_ingest_session(session_file: &Path) -> anyhow::Result<()> {
+/// Run session ingestion and return whether the session was newly indexed.
+pub fn run_ingest_session(
+    conn: &rusqlite::Connection,
+    session_file: &Path,
+) -> anyhow::Result<bool> {
     if !session_file.exists() {
         anyhow::bail!("File not found: {}", session_file.display());
     }
+    indexer::index_session(conn, session_file)
+}
+
+pub fn cmd_ingest_session(session_file: &Path) -> anyhow::Result<()> {
     let db_path = config::db_path();
     let conn = db::get_connection(&db_path)?;
-    if indexer::index_session(&conn, session_file)? {
-        eprintln!(
-            "Session indexed: {}",
-            session_file
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-        );
+    let indexed = run_ingest_session(&conn, session_file)?;
+    let name = session_file
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    if indexed {
+        eprintln!("Session indexed: {name}");
     } else {
-        eprintln!(
-            "Session unchanged: {}",
-            session_file
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-        );
+        eprintln!("Session unchanged: {name}");
     }
     Ok(())
 }
@@ -245,7 +259,7 @@ pub fn backfill_with_worker(db_path: &Path) -> anyhow::Result<()> {
 }
 
 /// Run backfill via a worker subprocess with specified batch size.
-fn backfill_with_worker_sized(db_path: &Path, batch_size: usize) -> anyhow::Result<()> {
+pub fn backfill_with_worker_sized(db_path: &Path, batch_size: usize) -> anyhow::Result<()> {
     use crate::status;
 
     let conn = db::get_connection(db_path)?;
@@ -723,21 +737,91 @@ fn render_doctor_report(report: &DoctorReport) {
     println!("{dim}\u{2570}{}\u{256f}{reset}", "\u{2500}".repeat(box_width));
 }
 
-pub fn cmd_status() -> anyhow::Result<()> {
+/// Structured status information for the system.
+#[derive(Debug, serde::Serialize)]
+pub struct StatusInfo {
+    pub embedder_running: bool,
+    pub embedder_pid: Option<u32>,
+    pub embedder_since: Option<String>,
+    pub backfill: Option<BackfillInfo>,
+    pub documents: Option<i64>,
+    pub chunks: Option<i64>,
+    pub vectors: Option<i64>,
+    pub dict_candidates_ready: Option<i64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct BackfillInfo {
+    pub filled: usize,
+    pub total: i64,
+    pub errors: usize,
+    pub since: String,
+}
+
+/// Collect system status as structured data.
+pub fn run_status(conn: Option<&rusqlite::Connection>) -> StatusInfo {
     use crate::status;
 
     let data_dir = config::data_dir();
-    let db_path = config::db_path();
     let sf = status::read(&data_dir);
+
+    let socket = Path::new(config::SOCKET_PATH);
+    let embedder_running = socket.exists();
+    let embedder_pid = sf.embedder.as_ref().map(|e| e.pid);
+    let embedder_since = sf.embedder.as_ref().map(|e| e.started_at.clone());
+
+    let backfill = sf.backfill.as_ref().map(|bf| BackfillInfo {
+        filled: bf.filled,
+        total: bf.total,
+        errors: bf.errors,
+        since: bf.started_at.clone(),
+    });
+
+    let (documents, chunks, vectors, dict_candidates_ready) = if let Some(conn) = conn {
+        let docs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+            .unwrap_or(0);
+        let ch: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap_or(0);
+        let vecs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
+            .unwrap_or(0);
+        let dict_ready = if db::has_candidates_table(conn) {
+            let summary = user_dict::candidate_summary(conn);
+            Some(summary.ready_count)
+        } else {
+            None
+        };
+        (Some(docs), Some(ch), Some(vecs), dict_ready)
+    } else {
+        (None, None, None, None)
+    };
+
+    StatusInfo {
+        embedder_running,
+        embedder_pid,
+        embedder_since,
+        backfill,
+        documents,
+        chunks,
+        vectors,
+        dict_candidates_ready,
+    }
+}
+
+pub fn cmd_status() -> anyhow::Result<()> {
+    let db_path = config::db_path();
+    let conn = db::get_connection(&db_path).ok();
+    let info = run_status(conn.as_ref());
 
     println!("=== The Space Memory Status ===\n");
 
     // Embedder
-    let socket = std::path::Path::new(config::SOCKET_PATH);
-    if socket.exists() {
-        if let Some(ref emb) = sf.embedder {
-            let since = format_since(&emb.started_at);
-            println!("  Embedder:  running (since {since}, PID {})", emb.pid);
+    if info.embedder_running {
+        if let (Some(pid), Some(ref since)) = (info.embedder_pid, &info.embedder_since) {
+            let since_fmt = format_since(since);
+            println!("  Embedder:  running (since {since_fmt}, PID {pid})");
         } else {
             println!("  Embedder:  running");
         }
@@ -746,16 +830,16 @@ pub fn cmd_status() -> anyhow::Result<()> {
     }
 
     // Backfill
-    if let Some(ref bf) = sf.backfill {
+    if let Some(ref bf) = info.backfill {
         let pct = if bf.total > 0 {
             (bf.filled as f64 / bf.total as f64 * 100.0) as u32
         } else {
             0
         };
-        let since = format_since(&bf.started_at);
+        let since = format_since(&bf.since);
         let processed = bf.filled + bf.errors;
         let eta = if processed > 0 && bf.total > 0 {
-            estimate_eta(&bf.started_at, processed, bf.total as usize)
+            estimate_eta(&bf.since, processed, bf.total as usize)
         } else {
             "calculating...".to_string()
         };
@@ -771,17 +855,7 @@ pub fn cmd_status() -> anyhow::Result<()> {
     }
 
     // DB stats
-    if let Ok(conn) = db::get_connection(&db_path) {
-        let docs: i64 = conn
-            .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
-            .unwrap_or(0);
-        let chunks: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
-            .unwrap_or(0);
-        let vecs: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
-            .unwrap_or(0);
-
+    if let (Some(docs), Some(chunks), Some(vecs)) = (info.documents, info.chunks, info.vectors) {
         println!("  Documents: {docs}");
         println!("  Chunks:    {chunks}");
         if chunks > 0 {
@@ -791,10 +865,9 @@ pub fn cmd_status() -> anyhow::Result<()> {
             println!("  Vectors:   0");
         }
 
-        if db::has_candidates_table(&conn) {
-            let summary = user_dict::candidate_summary(&conn);
-            if summary.ready_count > 0 {
-                println!("  Dict:      {} candidates ready", summary.ready_count);
+        if let Some(ready) = info.dict_candidates_ready {
+            if ready > 0 {
+                println!("  Dict:      {ready} candidates ready");
             } else {
                 println!("  Dict:      no candidates ready");
             }

@@ -172,7 +172,7 @@ fn main() -> anyhow::Result<()> {
                 recent: recent.clone(),
                 year,
             };
-            if let Some(resp) = try_daemon(&req) {
+            if let Some(resp) = try_daemon(&req)? {
                 render_search(resp, &format)?;
             } else {
                 cli::cmd_search(cli::SearchOptions {
@@ -192,7 +192,7 @@ fn main() -> anyhow::Result<()> {
             if !files_from_stdin {
                 // Full index — try daemon first
                 let req = DaemonRequest::Index { files: vec![] };
-                if let Some(resp) = try_daemon(&req) {
+                if let Some(resp) = try_daemon(&req)? {
                     render_index(resp)?;
                 } else {
                     cli::cmd_index(false)?;
@@ -208,7 +208,7 @@ fn main() -> anyhow::Result<()> {
                     .collect();
 
                 let req = DaemonRequest::Index { files: rel_paths };
-                if let Some(resp) = try_daemon(&req) {
+                if let Some(resp) = try_daemon(&req)? {
                     render_index(resp)?;
                 } else {
                     let stats = cli::run_index(
@@ -228,7 +228,7 @@ fn main() -> anyhow::Result<()> {
             let req = DaemonRequest::IngestSession {
                 session_file: session_file.to_string_lossy().to_string(),
             };
-            if let Some(resp) = try_daemon(&req) {
+            if let Some(resp) = try_daemon(&req)? {
                 render_ingest(resp, &session_file)?;
             } else {
                 cli::cmd_ingest_session(&session_file)?;
@@ -237,7 +237,7 @@ fn main() -> anyhow::Result<()> {
 
         Commands::Status => {
             let req = DaemonRequest::Status;
-            if let Some(resp) = try_daemon(&req) {
+            if let Some(resp) = try_daemon(&req)? {
                 render_status(resp)?;
             } else {
                 cli::cmd_status()?;
@@ -248,7 +248,7 @@ fn main() -> anyhow::Result<()> {
             let req = DaemonRequest::Doctor {
                 format: format.clone(),
             };
-            if let Some(resp) = try_daemon(&req) {
+            if let Some(resp) = try_daemon(&req)? {
                 render_doctor(resp, &format)?;
             } else {
                 cli::cmd_doctor(&format)?;
@@ -259,14 +259,8 @@ fn main() -> anyhow::Result<()> {
             let req = DaemonRequest::ImportWordnet {
                 wordnet_db: wordnet_db.to_string_lossy().to_string(),
             };
-            if let Some(resp) = try_daemon(&req) {
-                if !resp.ok {
-                    anyhow::bail!("{}", resp.error.unwrap_or_default());
-                }
-                if let Some(payload) = resp.payload {
-                    let count = payload["imported"].as_i64().unwrap_or(0);
-                    eprintln!("Imported {count} synonym pairs from WordNet.");
-                }
+            if let Some(resp) = try_daemon(&req)? {
+                render_import_wordnet(resp)?;
             } else {
                 cli::cmd_import_wordnet(&wordnet_db)?;
             }
@@ -277,49 +271,64 @@ fn main() -> anyhow::Result<()> {
 
 // ─── Daemon routing helpers ───────────────────────────────────────
 
-/// Try to send a request to the daemon. Returns Some(response) if daemon handled it, None to fallback.
-fn try_daemon(req: &DaemonRequest) -> Option<DaemonResponse> {
+/// Try to send a request to the daemon.
+/// Returns `Ok(Some(resp))` if daemon handled it.
+/// Returns `Ok(None)` if daemon is not running (fallback to direct).
+/// Returns `Err` if daemon is running but communication failed (no fallback — could cause double execution).
+fn try_daemon(req: &DaemonRequest) -> anyhow::Result<Option<DaemonResponse>> {
     let socket = config::daemon_socket_path();
     match daemon_protocol::try_send_request(&socket, req) {
-        Some(Ok(resp)) => Some(resp),
+        Some(Ok(resp)) => Ok(Some(resp)),
         Some(Err(e)) => {
-            eprintln!("warning: daemon communication error: {e}");
-            None // fallback to direct
+            anyhow::bail!("Daemon communication error: {e}\nRun `tsm stop` and retry.")
         }
-        None => None, // daemon not running
+        None => Ok(None), // daemon not running, direct fallback is safe
     }
 }
 
 /// Guard: error if the daemon is running (for commands that can't coexist).
 fn guard_daemon_not_running(command: &str) -> anyhow::Result<()> {
     let socket = config::daemon_socket_path();
-    if let Some(Ok(resp)) = daemon_protocol::try_send_request(&socket, &DaemonRequest::Ping) {
-        if resp.ok {
+    match daemon_protocol::try_send_request(&socket, &DaemonRequest::Ping) {
+        Some(Ok(resp)) if resp.ok => {
+            anyhow::bail!("tsmd is running. Run `tsm stop` before `{command}`.");
+        }
+        Some(Err(e)) => {
             anyhow::bail!(
-                "tsmd is running. Run `tsm stop` before `{command}`."
+                "Could not verify daemon status before `{command}`: {e}\nRun `tsm stop` to ensure the daemon is not running."
             );
         }
+        _ => Ok(()), // No socket or ping returned ok: false — safe to proceed
     }
-    Ok(())
 }
 
 // ─── Render helpers (daemon response → terminal output) ───────────
 
-fn render_search(resp: DaemonResponse, format: &str) -> anyhow::Result<()> {
+fn print_json(value: &serde_json::Value) {
+    println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+}
+
+fn check_resp(resp: &DaemonResponse) -> anyhow::Result<()> {
     if !resp.ok {
-        anyhow::bail!("{}", resp.error.unwrap_or_default());
+        anyhow::bail!(
+            "{}",
+            resp.error
+                .clone()
+                .unwrap_or_else(|| "(daemon returned error with no message)".into())
+        );
     }
+    Ok(())
+}
+
+fn render_search(resp: DaemonResponse, format: &str) -> anyhow::Result<()> {
+    check_resp(&resp)?;
     let payload = resp.payload.unwrap_or_default();
     match format {
-        "json" => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload).unwrap_or_default()
-            );
-        }
+        "json" => print_json(&payload),
         _ => {
             let results: Vec<the_space_memory::searcher::SearchResult> =
-                serde_json::from_value(payload).unwrap_or_default();
+                serde_json::from_value(payload)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse search results: {e}"))?;
             print!("{}", cli::format_text(&results));
         }
     }
@@ -327,9 +336,7 @@ fn render_search(resp: DaemonResponse, format: &str) -> anyhow::Result<()> {
 }
 
 fn render_index(resp: DaemonResponse) -> anyhow::Result<()> {
-    if !resp.ok {
-        anyhow::bail!("{}", resp.error.unwrap_or_default());
-    }
+    check_resp(&resp)?;
     if let Some(payload) = resp.payload {
         let indexed = payload["indexed"].as_i64().unwrap_or(0);
         let skipped = payload["skipped"].as_i64().unwrap_or(0);
@@ -340,9 +347,7 @@ fn render_index(resp: DaemonResponse) -> anyhow::Result<()> {
 }
 
 fn render_ingest(resp: DaemonResponse, session_file: &std::path::Path) -> anyhow::Result<()> {
-    if !resp.ok {
-        anyhow::bail!("{}", resp.error.unwrap_or_default());
-    }
+    check_resp(&resp)?;
     let name = session_file
         .file_name()
         .unwrap_or_default()
@@ -358,41 +363,39 @@ fn render_ingest(resp: DaemonResponse, session_file: &std::path::Path) -> anyhow
 }
 
 fn render_status(resp: DaemonResponse) -> anyhow::Result<()> {
-    if !resp.ok {
-        anyhow::bail!("{}", resp.error.unwrap_or_default());
-    }
+    check_resp(&resp)?;
     if let Some(payload) = resp.payload {
-        match serde_json::from_value::<cli::StatusInfo>(payload) {
-            Ok(info) => cli::print_status_info(&info),
-            Err(_) => eprintln!("(could not parse daemon status)"),
-        }
+        let info: cli::StatusInfo = serde_json::from_value(payload).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse daemon status: {e}\nTry `tsm stop && tsm start` to refresh."
+            )
+        })?;
+        cli::print_status_info(&info);
     }
     Ok(())
 }
 
 fn render_doctor(resp: DaemonResponse, format: &str) -> anyhow::Result<()> {
-    if !resp.ok {
-        anyhow::bail!("{}", resp.error.unwrap_or_default());
-    }
+    check_resp(&resp)?;
     let payload = resp.payload.unwrap_or_default();
-    match format {
-        "json" => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload).unwrap_or_default()
-            );
-        }
-        _ => {
-            match serde_json::from_value::<cli::DoctorReport>(payload.clone()) {
-                Ok(report) => cli::render_doctor_report(&report),
-                Err(_) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&payload).unwrap_or_default()
-                    );
-                }
-            }
-        }
+    if format == "json" {
+        print_json(&payload);
+        return Ok(());
+    }
+    let report: cli::DoctorReport = serde_json::from_value(payload).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse daemon doctor report: {e}\nTry `tsm stop && tsm start` to refresh."
+        )
+    })?;
+    cli::render_doctor_report(&report);
+    Ok(())
+}
+
+fn render_import_wordnet(resp: DaemonResponse) -> anyhow::Result<()> {
+    check_resp(&resp)?;
+    if let Some(payload) = resp.payload {
+        let count = payload["imported"].as_i64().unwrap_or(0);
+        eprintln!("Imported {count} synonym pairs from WordNet.");
     }
     Ok(())
 }

@@ -1461,4 +1461,59 @@ mod tests {
         let result = cmd_ingest_session(Path::new("/nonexistent/session.jsonl"));
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_doctor_report_serde_roundtrip() {
+        let report = DoctorReport {
+            sections: vec![DoctorSection {
+                name: "Database".to_string(),
+                items: vec![
+                    CheckItem {
+                        status: CheckStatus::Ok,
+                        message: "DB: /tmp/test.db (1.0 MB)".to_string(),
+                        hint: None,
+                    },
+                    CheckItem {
+                        status: CheckStatus::Warning,
+                        message: "Vectors: 0 / 100 chunks".to_string(),
+                        hint: Some("Run `vector-fill`.".to_string()),
+                    },
+                    CheckItem {
+                        status: CheckStatus::Error,
+                        message: "DB missing".to_string(),
+                        hint: Some("Run `init`.".to_string()),
+                    },
+                ],
+            }],
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        let decoded: DoctorReport = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.sections.len(), 1);
+        assert_eq!(decoded.sections[0].items.len(), 3);
+        assert_eq!(decoded.sections[0].items[0].status, CheckStatus::Ok);
+        assert_eq!(decoded.sections[0].items[1].status, CheckStatus::Warning);
+        assert_eq!(decoded.sections[0].items[2].status, CheckStatus::Error);
+        assert!(decoded.sections[0].items[0].hint.is_none());
+        assert!(decoded.sections[0].items[1].hint.is_some());
+    }
+
+    #[test]
+    fn test_doctor_to_json_output_shape() {
+        let report = DoctorReport {
+            sections: vec![DoctorSection {
+                name: "Test".to_string(),
+                items: vec![CheckItem {
+                    status: CheckStatus::Ok,
+                    message: "All good".to_string(),
+                    hint: None,
+                }],
+            }],
+        };
+        let json_str = report.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(parsed["sections"].is_array());
+        assert_eq!(parsed["issue_count"], 0);
+        assert_eq!(parsed["sections"][0]["name"], "Test");
+        assert_eq!(parsed["sections"][0]["items"][0]["status"], "ok");
+    }
 }

@@ -118,11 +118,8 @@ pub fn try_send_request(socket: &Path, req: &DaemonRequest) -> Option<Result<Dae
         Ok(s) => s,
         Err(_) => return None, // stale socket or connection refused
     };
-    if stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(300)))
-        .is_err()
-    {
-        return None;
+    if let Err(e) = stream.set_read_timeout(Some(std::time::Duration::from_secs(300))) {
+        return Some(Err(anyhow::anyhow!("Failed to set socket read timeout: {e}")));
     }
     let req_bytes = match serde_json::to_vec(req) {
         Ok(b) => b,
@@ -442,6 +439,38 @@ mod tests {
         let mut client = UnixStream::connect(&sock_path).unwrap();
         write_message(&mut client, b"not valid json").unwrap();
         drop(client);
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn try_send_request_success() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("test-try.sock");
+        let sock_path_clone = sock_path.clone();
+
+        let server = std::thread::spawn(move || {
+            let listener = UnixListener::bind(&sock_path_clone).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let req = read_request(&mut stream).unwrap();
+            assert!(matches!(req, DaemonRequest::Ping));
+            let resp = DaemonResponse::success_empty();
+            write_response(&mut stream, &resp).unwrap();
+        });
+
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let result = try_send_request(&sock_path, &DaemonRequest::Ping);
+        assert!(result.is_some());
+        let resp = result.unwrap().unwrap();
+        assert!(resp.ok);
 
         server.join().unwrap();
     }

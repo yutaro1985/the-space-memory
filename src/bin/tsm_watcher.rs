@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -89,21 +90,23 @@ fn main() -> Result<()> {
     while !SHUTDOWN.load(Ordering::SeqCst) {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(events)) => {
-                let mut files_to_index: Vec<String> = Vec::new();
-
+                let mut files_to_index: HashSet<String> = HashSet::new();
                 for event in &events {
                     if event.kind != DebouncedEventKind::Any {
                         continue;
                     }
-                    let path = &event.path;
-
-                    // Only process .md files
-                    if path.extension().is_some_and(|e| e == "md") {
-                        if let Ok(rel) = path.strip_prefix(&project_root) {
-                            let rel_str = rel.to_string_lossy().to_string();
-                            if !files_to_index.contains(&rel_str) {
-                                files_to_index.push(rel_str);
-                            }
+                    if event.path.extension().is_none_or(|ext| ext != "md") {
+                        continue;
+                    }
+                    match event.path.strip_prefix(&project_root) {
+                        Ok(rel) => {
+                            files_to_index.insert(rel.to_string_lossy().into_owned());
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "tsm-watcher: warning: path {} outside project root, skipping",
+                                event.path.display()
+                            );
                         }
                     }
                 }
@@ -111,7 +114,7 @@ fn main() -> Result<()> {
                 if !files_to_index.is_empty() {
                     let count = files_to_index.len();
                     let req = DaemonRequest::Index {
-                        files: files_to_index,
+                        files: files_to_index.into_iter().collect(),
                     };
                     match daemon_protocol::send_request(&daemon_socket, &req) {
                         Ok(resp) => {

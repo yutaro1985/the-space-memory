@@ -80,11 +80,31 @@ fn main() -> Result<()> {
 
     eprintln!("tsmd: listening on {} (PID {pid})", socket_path.display());
 
+    // Install signal handlers BEFORE spawning children
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            signal_handler as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            signal_handler as *const () as libc::sighandler_t,
+        );
+    }
+
     // Start child processes
     let mut embedder_child: Option<Child> = if !args.no_embedder {
+        remove_stale_embedder_socket();
         match start_child("tsm-embedder", &[("TSM_EMBEDDER_IDLE_TIMEOUT", "0")]) {
             Ok(child) => {
-                eprintln!("tsmd: embedder started (PID {})", child.id());
+                let child_pid = child.id();
+                eprintln!("tsmd: embedder started (PID {child_pid})");
+                status::update(&data_dir, |s| {
+                    s.embedder = Some(status::EmbedderStatus {
+                        started_at: chrono::Utc::now().to_rfc3339(),
+                        pid: child_pid,
+                    });
+                });
                 Some(child)
             }
             Err(e) => {
@@ -100,7 +120,14 @@ fn main() -> Result<()> {
     let mut watcher_child: Option<Child> = if !args.no_watcher {
         match start_child("tsm-watcher", &[]) {
             Ok(child) => {
-                eprintln!("tsmd: watcher started (PID {})", child.id());
+                let child_pid = child.id();
+                eprintln!("tsmd: watcher started (PID {child_pid})");
+                status::update(&data_dir, |s| {
+                    s.watcher = Some(status::WatcherStatus {
+                        started_at: chrono::Utc::now().to_rfc3339(),
+                        pid: child_pid,
+                    });
+                });
                 Some(child)
             }
             Err(e) => {
@@ -112,18 +139,6 @@ fn main() -> Result<()> {
         eprintln!("tsmd: watcher disabled (--no-watcher)");
         None
     };
-
-    // Install signal handlers
-    unsafe {
-        libc::signal(
-            libc::SIGTERM,
-            signal_handler as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGINT,
-            signal_handler as *const () as libc::sighandler_t,
-        );
-    }
 
     let mut embedder_restarts = 0u32;
     let mut watcher_restarts = 0u32;
@@ -143,22 +158,10 @@ fn main() -> Result<()> {
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                maybe_restart_child(
-                    "embedder",
-                    "tsm-embedder",
-                    &[("TSM_EMBEDDER_IDLE_TIMEOUT", "0")],
-                    &mut embedder_child,
-                    &mut embedder_restarts,
-                    MAX_CHILD_RESTARTS,
-                );
-                maybe_restart_child(
-                    "watcher",
-                    "tsm-watcher",
-                    &[],
-                    &mut watcher_child,
-                    &mut watcher_restarts,
-                    MAX_CHILD_RESTARTS,
-                );
+                if maybe_restart_child("embedder", &mut embedder_child, &mut embedder_restarts, MAX_CHILD_RESTARTS) {
+                    remove_stale_embedder_socket();
+                }
+                maybe_restart_child("watcher", &mut watcher_child, &mut watcher_restarts, MAX_CHILD_RESTARTS);
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(e) => {
@@ -177,6 +180,7 @@ fn main() -> Result<()> {
     let _ = std::fs::remove_file(&pid_path);
     status::update(&data_dir, |s| {
         s.daemon = None;
+        s.watcher = None;
     });
 
     Ok(())
@@ -196,17 +200,6 @@ fn sibling_binary(name: &str) -> Result<PathBuf> {
 /// Start a child process by binary name, with optional environment variables.
 fn start_child(binary: &str, env_vars: &[(&str, &str)]) -> Result<Child> {
     let bin_path = sibling_binary(binary)?;
-
-    // Clean up stale embedder socket if starting the embedder
-    if binary == "tsm-embedder" {
-        let embedder_socket = Path::new(config::SOCKET_PATH);
-        if embedder_socket.exists() {
-            if let Err(e) = std::fs::remove_file(embedder_socket) {
-                eprintln!("tsmd: warning: could not remove stale embedder socket: {e}");
-            }
-        }
-    }
-
     let mut cmd = Command::new(&bin_path);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -214,56 +207,108 @@ fn start_child(binary: &str, env_vars: &[(&str, &str)]) -> Result<Child> {
     for &(k, v) in env_vars {
         cmd.env(k, v);
     }
-
     cmd.spawn()
         .context(format!("Failed to spawn {binary}"))
 }
 
+/// Remove the embedder UNIX socket if it exists.
+fn remove_stale_embedder_socket() {
+    let path = Path::new(config::SOCKET_PATH);
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(path) {
+            eprintln!("tsmd: warning: could not remove stale embedder socket: {e}");
+        }
+    }
+}
+
 /// Check if a child has exited and restart it within the retry limit.
+/// Returns `true` if a restart was attempted (for pre-restart hooks like socket cleanup).
 fn maybe_restart_child(
     label: &str,
-    binary: &str,
-    env_vars: &[(&str, &str)],
     child: &mut Option<Child>,
     restarts: &mut u32,
     max: u32,
-) {
+) -> bool {
     let exited = match child {
-        Some(c) => matches!(c.try_wait(), Ok(Some(_))),
-        None => return,
+        Some(c) => match c.try_wait() {
+            Ok(Some(exit_status)) => {
+                eprintln!("tsmd: {label} exited with status: {exit_status}");
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                eprintln!("tsmd: error checking {label} status: {e}");
+                false
+            }
+        },
+        None => return false,
     };
 
     if !exited {
-        return;
+        return false;
     }
 
     if *restarts >= max {
         eprintln!("tsmd: {label} crashed {max} times, giving up");
         *child = None;
-        return;
+        return false;
     }
 
     *restarts += 1;
     eprintln!("tsmd: {label} exited, restarting ({restarts}/{max})...");
+
+    // Determine binary name and env vars from label
+    let (binary, env_vars): (&str, &[(&str, &str)]) = match label {
+        "embedder" => ("tsm-embedder", &[("TSM_EMBEDDER_IDLE_TIMEOUT", "0")]),
+        "watcher" => ("tsm-watcher", &[]),
+        _ => {
+            eprintln!("tsmd: unknown child label: {label}");
+            *child = None;
+            return false;
+        }
+    };
+
     match start_child(binary, env_vars) {
         Ok(new_child) => {
             eprintln!("tsmd: {label} restarted (PID {})", new_child.id());
             *child = Some(new_child);
             *restarts = 0;
+            true
         }
         Err(e) => {
             eprintln!("tsmd: failed to restart {label}: {e}");
             *child = None;
+            false
         }
     }
 }
 
-/// Stop a child process gracefully.
+/// Stop a child process: SIGTERM → wait (2s grace) → SIGKILL.
 fn stop_child(label: &str, child: Option<Child>) {
     if let Some(mut child) = child {
-        eprintln!("tsmd: stopping {label} (PID {})...", child.id());
-        let _ = child.kill();
-        let _ = child.wait();
+        let pid = child.id();
+        eprintln!("tsmd: stopping {label} (PID {pid})...");
+
+        // Send SIGTERM for graceful shutdown
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+
+        // Wait up to 2 seconds for graceful exit
+        for _ in 0..20 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // Force kill if still running
+        if let Err(e) = child.kill() {
+            eprintln!("tsmd: warning: failed to kill {label} (PID {pid}): {e}");
+        }
+        if let Err(e) = child.wait() {
+            eprintln!("tsmd: warning: failed to wait for {label} (PID {pid}): {e}");
+        }
     }
 }
 

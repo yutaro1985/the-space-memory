@@ -393,49 +393,9 @@ fn handle_client(mut stream: UnixStream, embedder: &Embedder) -> Result<()> {
 // ─── Client ────────────────────────────────────────────────────────
 
 /// Send texts to the embedder daemon and get embeddings back.
-/// Auto-starts the daemon if not running. Returns None if startup fails.
+/// Returns None if the embedder is not running.
 pub fn embed_via_socket(texts: &[String]) -> Option<Vec<Vec<f32>>> {
-    let socket_path = Path::new(config::SOCKET_PATH);
-    if !socket_path.exists() && !auto_start_daemon() {
-        return None;
-    }
-    embed_via_socket_at(socket_path, texts)
-}
-
-/// Spawn the embedder daemon as a background subprocess.
-/// Waits up to 30 seconds for the socket to appear.
-fn auto_start_daemon() -> bool {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    let socket_path = Path::new(config::SOCKET_PATH);
-
-    eprintln!("Auto-starting embedder daemon...");
-    match Command::new(exe)
-        .arg("embedder-start")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(_) => {
-            // Wait for socket to appear
-            for _ in 0..300 {
-                if socket_path.exists() {
-                    eprintln!("Embedder daemon ready.");
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            eprintln!("Embedder daemon did not start in time.");
-            false
-        }
-        Err(e) => {
-            eprintln!("Failed to start embedder daemon: {e}");
-            false
-        }
-    }
+    embed_via_socket_at(Path::new(config::SOCKET_PATH), texts)
 }
 
 /// Send texts to the embedder daemon at a specific socket path.

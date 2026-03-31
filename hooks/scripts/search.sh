@@ -24,21 +24,8 @@ fi
 
 cd "${CLAUDE_PROJECT_DIR:-/workspaces/workspace}"
 
-SOCKET="/tmp/tsm-embedder.sock"
-
-# embedder デーモンが起動していなければバックグラウンドで起動
-if [ ! -S "$SOCKET" ]; then
-  echo "[$(date -Iseconds)] embedder not running, starting..." >> "$LOG"
-  nohup "$TSM" embedder-start >/dev/null 2>&1 &
-  disown
-  for _ in $(seq 1 50); do
-    [ -S "$SOCKET" ] && break
-    sleep 0.1
-  done
-fi
-
-# 検索実行
-RESULT=$("$TSM" search --query "$QUERY" --format json 2>/dev/null) || {
+# 検索実行（tsmd が未起動なら自動起動される）
+RESULT=$("$TSM" search --query "$QUERY" --format json 2>>"$LOG") || {
   echo "[$(date -Iseconds)] FAIL: tsm search exited with $?" >> "$LOG"
   exit 0
 }

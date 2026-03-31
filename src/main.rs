@@ -79,7 +79,8 @@ enum Commands {
         /// Path to the JSONL file
         session_file: PathBuf,
     },
-    /// Start the embedder daemon
+    /// Internal: start the embedder daemon (managed by tsmd)
+    #[command(hide = true)]
     EmbedderStart,
     /// Download model files from HuggingFace Hub
     Setup,
@@ -151,7 +152,7 @@ fn main() -> anyhow::Result<()> {
             cli::cmd_dict_update(threshold, yes, format.into())?;
         }
 
-        // ── Daemon-routed with direct fallback ──
+        // ── Daemon-routed (auto-starts tsmd if needed) ──
         Commands::Search {
             query,
             top_k,
@@ -163,42 +164,20 @@ fn main() -> anyhow::Result<()> {
             year,
         } => {
             let req = DaemonRequest::Search {
-                query: query.clone(),
+                query,
                 top_k,
                 format: format.clone(),
                 include_content,
-                after: after.clone(),
-                before: before.clone(),
-                recent: recent.clone(),
+                after,
+                before,
+                recent,
                 year,
             };
-            if let Some(resp) = try_daemon(&req)? {
-                render_search(resp, &format)?;
-            } else {
-                cli::cmd_search(cli::SearchOptions {
-                    query: &query,
-                    top_k,
-                    format: &format,
-                    include_content,
-                    after: after.as_deref(),
-                    before: before.as_deref(),
-                    recent: recent.as_deref(),
-                    year,
-                })?;
-            }
+            render_search(send_to_daemon(&req)?, &format)?;
         }
 
         Commands::Index { files_from_stdin } => {
-            if !files_from_stdin {
-                // Full index — try daemon first
-                let req = DaemonRequest::Index { files: vec![] };
-                if let Some(resp) = try_daemon(&req)? {
-                    render_index(resp)?;
-                } else {
-                    cli::cmd_index(false)?;
-                }
-            } else {
-                // stdin paths — collect first, then route
+            let req = if files_from_stdin {
                 let project_root = config::project_root();
                 let paths = cli::read_paths_from_stdin(&project_root);
                 let rel_paths: Vec<String> = paths
@@ -206,64 +185,36 @@ fn main() -> anyhow::Result<()> {
                     .filter_map(|p| p.strip_prefix(&project_root).ok())
                     .map(|p| p.to_string_lossy().to_string())
                     .collect();
-
-                let req = DaemonRequest::Index { files: rel_paths };
-                if let Some(resp) = try_daemon(&req)? {
-                    render_index(resp)?;
-                } else {
-                    let stats = cli::run_index(
-                        &the_space_memory::db::get_connection(&config::db_path())?,
-                        &paths,
-                        &project_root,
-                    )?;
-                    eprintln!(
-                        "Indexed: {}, Skipped: {}, Removed: {}",
-                        stats.indexed, stats.skipped, stats.removed
-                    );
-                }
-            }
+                DaemonRequest::Index { files: rel_paths }
+            } else {
+                DaemonRequest::Index { files: vec![] }
+            };
+            render_index(send_to_daemon(&req)?)?;
         }
 
         Commands::IngestSession { session_file } => {
             let req = DaemonRequest::IngestSession {
                 session_file: session_file.to_string_lossy().to_string(),
             };
-            if let Some(resp) = try_daemon(&req)? {
-                render_ingest(resp, &session_file)?;
-            } else {
-                cli::cmd_ingest_session(&session_file)?;
-            }
+            render_ingest(send_to_daemon(&req)?, &session_file)?;
         }
 
         Commands::Status => {
-            let req = DaemonRequest::Status;
-            if let Some(resp) = try_daemon(&req)? {
-                render_status(resp)?;
-            } else {
-                cli::cmd_status()?;
-            }
+            render_status(send_to_daemon(&DaemonRequest::Status)?)?;
         }
 
         Commands::Doctor { format } => {
             let req = DaemonRequest::Doctor {
                 format: format.clone(),
             };
-            if let Some(resp) = try_daemon(&req)? {
-                render_doctor(resp, &format)?;
-            } else {
-                cli::cmd_doctor(&format)?;
-            }
+            render_doctor(send_to_daemon(&req)?, &format)?;
         }
 
         Commands::ImportWordnet { wordnet_db } => {
             let req = DaemonRequest::ImportWordnet {
                 wordnet_db: wordnet_db.to_string_lossy().to_string(),
             };
-            if let Some(resp) = try_daemon(&req)? {
-                render_import_wordnet(resp)?;
-            } else {
-                cli::cmd_import_wordnet(&wordnet_db)?;
-            }
+            render_import_wordnet(send_to_daemon(&req)?)?;
         }
     }
     Ok(())
@@ -271,19 +222,24 @@ fn main() -> anyhow::Result<()> {
 
 // ─── Daemon routing helpers ───────────────────────────────────────
 
-/// Try to send a request to the daemon.
-/// Returns `Ok(Some(resp))` if daemon handled it.
-/// Returns `Ok(None)` if daemon is not running (fallback to direct).
-/// Returns `Err` if daemon is running but communication failed (no fallback — could cause double execution).
-fn try_daemon(req: &DaemonRequest) -> anyhow::Result<Option<DaemonResponse>> {
+/// Send a request to the daemon, auto-starting it if necessary.
+fn send_to_daemon(req: &DaemonRequest) -> anyhow::Result<DaemonResponse> {
     let socket = config::daemon_socket_path();
+
+    // First attempt
     match daemon_protocol::try_send_request(&socket, req) {
-        Some(Ok(resp)) => Ok(Some(resp)),
+        Some(Ok(resp)) => return Ok(resp),
         Some(Err(e)) => {
             anyhow::bail!("Daemon communication error: {e}\nRun `tsm stop` and retry.")
         }
-        None => Ok(None), // daemon not running, direct fallback is safe
+        None => {} // daemon not running, auto-start below
     }
+
+    // Auto-start tsmd
+    cmd_start()?;
+
+    // Retry after start
+    daemon_protocol::send_request(&socket, req)
 }
 
 /// Guard: error if the daemon is running (for commands that can't coexist).
@@ -432,11 +388,21 @@ fn cmd_start() -> anyhow::Result<()> {
         );
     }
 
-    // Spawn tsmd in a new session (detached)
+    // Spawn tsmd in a new session (detached), stderr to log file
+    let log_path = config::data_dir().join("tsmd.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .ok();
+    let stderr_cfg = match log_file {
+        Some(f) => std::process::Stdio::from(f),
+        None => std::process::Stdio::null(),
+    };
     let mut cmd = std::process::Command::new(&tsmd_path);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(stderr_cfg);
     unsafe {
         cmd.pre_exec(|| {
             libc::setsid();

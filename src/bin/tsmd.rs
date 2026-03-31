@@ -1,5 +1,6 @@
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -29,6 +30,10 @@ struct Args {
     /// Database path
     #[arg(long)]
     db: Option<PathBuf>,
+
+    /// Skip embedder startup
+    #[arg(long)]
+    no_embedder: bool,
 }
 
 fn main() -> Result<()> {
@@ -71,6 +76,23 @@ fn main() -> Result<()> {
 
     eprintln!("tsmd: listening on {} (PID {pid})", socket_path.display());
 
+    // Start embedder as a child process
+    let mut embedder_child: Option<Child> = if !args.no_embedder {
+        match start_embedder() {
+            Ok(child) => {
+                eprintln!("tsmd: embedder started (PID {})", child.id());
+                Some(child)
+            }
+            Err(e) => {
+                eprintln!("tsmd: warning: failed to start embedder: {e}");
+                None
+            }
+        }
+    } else {
+        eprintln!("tsmd: embedder disabled (--no-embedder)");
+        None
+    };
+
     // Install signal handlers
     unsafe {
         libc::signal(
@@ -82,6 +104,9 @@ fn main() -> Result<()> {
             signal_handler as *const () as libc::sighandler_t,
         );
     }
+
+    let mut embedder_restarts = 0u32;
+    const MAX_EMBEDDER_RESTARTS: u32 = 3;
 
     // Accept loop
     while !SHUTDOWN.load(Ordering::SeqCst) {
@@ -97,6 +122,8 @@ fn main() -> Result<()> {
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Check embedder health on each idle poll (every 100ms)
+                maybe_restart_embedder(&mut embedder_child, &mut embedder_restarts, MAX_EMBEDDER_RESTARTS);
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(e) => {
@@ -108,6 +135,14 @@ fn main() -> Result<()> {
 
     // Cleanup
     eprintln!("tsmd: shutting down");
+
+    // Stop embedder child
+    if let Some(mut child) = embedder_child {
+        eprintln!("tsmd: stopping embedder (PID {})...", child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&pid_path);
     status::update(&data_dir, |s| {
@@ -115,6 +150,72 @@ fn main() -> Result<()> {
     });
 
     Ok(())
+}
+
+/// Check if the embedder child has exited and restart it if within the retry limit.
+/// Sets `child` to `None` once the limit is exhausted or when a restart fails to spawn.
+fn maybe_restart_embedder(child: &mut Option<Child>, restarts: &mut u32, max: u32) {
+    let exited = match child {
+        Some(c) => matches!(c.try_wait(), Ok(Some(_))),
+        None => return,
+    };
+
+    if !exited {
+        return;
+    }
+
+    if *restarts >= max {
+        eprintln!("tsmd: embedder crashed {max} times, giving up");
+        *child = None;
+        return;
+    }
+
+    *restarts += 1;
+    eprintln!("tsmd: embedder exited, restarting ({restarts}/{max})...");
+    match start_embedder() {
+        Ok(new_child) => {
+            eprintln!("tsmd: embedder restarted (PID {})", new_child.id());
+            *child = Some(new_child);
+            *restarts = 0; // reset on successful restart
+        }
+        Err(e) => {
+            eprintln!("tsmd: failed to restart embedder: {e}");
+            *child = None;
+        }
+    }
+}
+
+/// Start the embedder as a child process with idle timeout disabled.
+fn start_embedder() -> Result<Child> {
+    let embedder_socket = Path::new(config::SOCKET_PATH);
+
+    // Clean up stale embedder socket
+    if embedder_socket.exists() {
+        if let Err(e) = std::fs::remove_file(embedder_socket) {
+            eprintln!("tsmd: warning: could not remove stale embedder socket: {e}");
+        }
+    }
+
+    // Find the tsm binary (same directory as tsmd)
+    let exe_dir = std::env::current_exe()?
+        .parent()
+        .context("executable has no parent directory")?
+        .to_path_buf();
+    let tsm_path = exe_dir.join("tsm");
+
+    let child = Command::new(&tsm_path)
+        .arg("embedder-start")
+        .env("TSM_EMBEDDER_IDLE_TIMEOUT", "0") // disable idle timeout
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit()) // inherit stderr for embedder logs
+        .spawn()
+        .context("Failed to spawn embedder process")?;
+
+    // Don't block waiting for embedder socket — model loading can take tens of seconds.
+    // The accept loop starts immediately; embed_via_socket returns None until ready,
+    // and backfill handles missing vectors later.
+    Ok(child)
 }
 
 fn handle_client(

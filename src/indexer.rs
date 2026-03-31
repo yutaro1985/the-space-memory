@@ -353,9 +353,8 @@ pub fn index_session(conn: &Connection, jsonl_path: &Path) -> anyhow::Result<boo
     }
     tx.commit()?;
 
-    // Insert vectors only if embedder is already running (don't auto-start).
-    // Backfill will handle missing vectors later.
-    insert_vectors_no_autostart(conn, &chunk_entries);
+    // Insert vectors if embedder is running; backfill handles the rest.
+    insert_vectors(conn, &chunk_entries);
 
     // Learn synonyms from human messages in the session (wrapped in transaction)
     learn_from_session_jsonl(conn, jsonl_path);
@@ -446,37 +445,13 @@ fn insert_vectors(conn: &Connection, chunk_entries: &[(i64, String)]) {
     if !db::has_vec_table(conn) {
         return;
     }
-
-    let texts: Vec<String> = chunk_entries.iter().map(|(_, text)| text.clone()).collect();
-    let embeddings = match embedder::embed_via_socket(&texts) {
-        Some(e) => e,
-        None => return,
-    };
-
-    for ((chunk_id, _), emb) in chunk_entries.iter().zip(embeddings.iter()) {
-        write_vec_row(conn, *chunk_id, emb);
-    }
-}
-
-/// Insert vectors only if the embedder daemon is already running.
-/// Does NOT auto-start the daemon — lets backfill handle missing vectors later.
-fn insert_vectors_no_autostart(conn: &Connection, chunk_entries: &[(i64, String)]) {
-    if chunk_entries.is_empty() {
-        return;
-    }
-    if !db::has_vec_table(conn) {
-        return;
-    }
-    // Only proceed if the socket already exists (embedder is running)
+    // Skip socket I/O if embedder is not running
     if !std::path::Path::new(config::SOCKET_PATH).exists() {
         return;
     }
 
     let texts: Vec<String> = chunk_entries.iter().map(|(_, text)| text.clone()).collect();
-    let embeddings = match embedder::embed_via_socket_at(
-        std::path::Path::new(config::SOCKET_PATH),
-        &texts,
-    ) {
+    let embeddings = match embedder::embed_via_socket(&texts) {
         Some(e) => e,
         None => return,
     };

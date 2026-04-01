@@ -74,24 +74,42 @@ impl std::str::FromStr for SearchFallback {
     }
 }
 
-/// Content directories with score weights. (directory, weight)
-pub const CONTENT_DIRS: &[(&str, f64)] = &[
-    // daily
-    ("daily/notes", 1.0),
-    ("daily/daily/research", 1.1),
-    ("daily/daily/intel", 0.7),
-    // company
-    ("company/knowledge", 1.3),
-    ("company/ideas", 0.9),
-    ("company/updates", 0.8),
-    ("company/research", 1.2),
-    ("company/products", 1.2),
-    ("company/decisions", 1.1),
-    ("company/retrospectives", 0.9),
-];
-pub const SESSION_WEIGHT: f64 = 0.3;
+const DEFAULT_SESSION_WEIGHT: f64 = 0.3;
+const DEFAULT_SESSION_HALF_LIFE_DAYS: f64 = 30.0;
 
 // ─── Config struct ───────────────────────────────────────────────
+
+/// A content directory entry as written in tsm.toml.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct ContentDirConfig {
+    pub path: String,
+    pub weight: Option<f64>,
+    pub half_life_days: Option<f64>,
+}
+
+/// A content directory entry with all values resolved.
+#[derive(Debug, Clone)]
+pub struct ContentDir {
+    pub path: String,
+    pub weight: f64,
+    pub half_life_days: f64,
+}
+
+/// Claude session scoring config as written in tsm.toml.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct ClaudeSessionConfig {
+    pub weight: Option<f64>,
+    pub half_life_days: Option<f64>,
+}
+
+/// The `[index]` section of tsm.toml.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct IndexConfig {
+    pub content_dirs: Vec<ContentDirConfig>,
+    pub claude_session: ClaudeSessionConfig,
+}
 
 /// Shape of tsm.toml — all fields optional for partial config files.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -105,6 +123,8 @@ pub(crate) struct ConfigFile {
     embedder_idle_timeout_secs: Option<u64>,
     embedder_backfill_interval_secs: Option<u64>,
     search_fallback: Option<SearchFallback>,
+    #[serde(default)]
+    index: IndexConfig,
 }
 
 /// Fully resolved configuration — all values determined at startup.
@@ -153,6 +173,16 @@ pub struct ResolvedConfig {
     /// Default: `Error` (refuse to search without vector search).
     /// Env: `TSM_SEARCH_FALLBACK`. Config: `search_fallback`.
     pub search_fallback: SearchFallback,
+
+    /// Content directories with scoring weights and half-life.
+    /// Empty = auto-discover mode (recursively index all .md under index_root).
+    pub content_dirs: Vec<ContentDir>,
+
+    /// Score weight for Claude Code session data.
+    pub session_weight: f64,
+
+    /// Half-life in days for Claude Code session data time decay.
+    pub session_half_life_days: f64,
 }
 
 impl ResolvedConfig {
@@ -197,6 +227,66 @@ impl ResolvedConfig {
 
         let search_fallback = env_parse_fallback(file_cfg.search_fallback);
 
+        let mut content_dirs: Vec<ContentDir> = file_cfg
+            .index
+            .content_dirs
+            .iter()
+            .filter_map(|c| {
+                if c.path.is_empty() {
+                    log::warn!("content_dirs entry has empty path; skipping");
+                    return None;
+                }
+                if std::path::Path::new(&c.path).is_absolute() {
+                    log::warn!(
+                        "content_dirs entry '{}' is absolute; paths must be relative to index_root",
+                        c.path
+                    );
+                    return None;
+                }
+                let weight = c.weight.unwrap_or(1.0);
+                if !weight.is_finite() || weight <= 0.0 {
+                    log::warn!(
+                        "content_dirs '{}': weight {weight} is invalid; using 1.0",
+                        c.path
+                    );
+                }
+                let half_life = c.half_life_days.unwrap_or(DEFAULT_HALF_LIFE_DAYS);
+                if !half_life.is_finite() || half_life <= 0.0 {
+                    log::warn!(
+                        "content_dirs '{}': half_life_days {half_life} is invalid; using {DEFAULT_HALF_LIFE_DAYS}",
+                        c.path
+                    );
+                }
+                Some(ContentDir {
+                    path: c.path.clone(),
+                    weight: if weight.is_finite() && weight > 0.0 {
+                        weight
+                    } else {
+                        1.0
+                    },
+                    half_life_days: if half_life.is_finite() && half_life > 0.0 {
+                        half_life
+                    } else {
+                        DEFAULT_HALF_LIFE_DAYS
+                    },
+                })
+            })
+            .collect();
+        // Sort longest-first so more-specific paths match before shorter prefixes
+        content_dirs.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+
+        let session_weight = file_cfg
+            .index
+            .claude_session
+            .weight
+            .unwrap_or(DEFAULT_SESSION_WEIGHT);
+
+        let session_half_life_days = file_cfg
+            .index
+            .claude_session
+            .half_life_days
+            .unwrap_or(DEFAULT_SESSION_HALF_LIFE_DAYS);
+
         Self {
             state_dir,
             index_root,
@@ -206,6 +296,9 @@ impl ResolvedConfig {
             embedder_idle_timeout_secs,
             embedder_backfill_interval_secs,
             search_fallback,
+            content_dirs,
+            session_weight,
+            session_half_life_days,
         }
     }
 }
@@ -287,6 +380,19 @@ fn load_config_from(candidates: &[PathBuf]) -> ConfigFile {
             .embedder_backfill_interval_secs
             .or(file.embedder_backfill_interval_secs);
         merged.search_fallback = merged.search_fallback.or(file.search_fallback);
+        if merged.index.content_dirs.is_empty() {
+            merged.index.content_dirs = file.index.content_dirs;
+        }
+        merged.index.claude_session.weight = merged
+            .index
+            .claude_session
+            .weight
+            .or(file.index.claude_session.weight);
+        merged.index.claude_session.half_life_days = merged
+            .index
+            .claude_session
+            .half_life_days
+            .or(file.index.claude_session.half_life_days);
     }
     merged
 }
@@ -335,6 +441,18 @@ pub fn embedder_backfill_interval_secs() -> u64 {
 
 pub fn search_fallback() -> SearchFallback {
     resolved().search_fallback
+}
+
+pub fn content_dirs() -> &'static [ContentDir] {
+    &resolved().content_dirs
+}
+
+pub fn session_weight() -> f64 {
+    resolved().session_weight
+}
+
+pub fn session_half_life_days() -> f64 {
+    resolved().session_half_life_days
 }
 
 // ─── Derived paths ───────────────────────────────────────────────
@@ -400,7 +518,24 @@ pub fn status_penalty(status: Option<&str>) -> f64 {
     }
 }
 
-pub fn half_life_days(source_type: &str) -> f64 {
+/// Half-life in days, resolved from content_dirs config by file path prefix.
+/// Falls back to source_type-based defaults when content_dirs is empty or unmatched.
+pub fn half_life_days(file_path: &str, source_type: &str) -> f64 {
+    if file_path.starts_with("session:") {
+        return resolved().session_half_life_days;
+    }
+    for dir in &resolved().content_dirs {
+        if file_path.starts_with(dir.path.as_str())
+            && file_path.as_bytes().get(dir.path.len()) == Some(&b'/')
+        {
+            return dir.half_life_days;
+        }
+    }
+    half_life_days_by_source_type(source_type)
+}
+
+/// Default half-life by source_type (used when content_dirs is empty or unmatched).
+fn half_life_days_by_source_type(source_type: &str) -> f64 {
     match source_type {
         "note" => 120.0,
         "research" => 60.0,
@@ -429,11 +564,13 @@ pub fn source_type_from_dir(directory: &str) -> String {
 /// Score weight based on directory prefix of file_path.
 pub fn directory_weight(file_path: &str) -> f64 {
     if file_path.starts_with("session:") {
-        return SESSION_WEIGHT;
+        return resolved().session_weight;
     }
-    for &(dir, weight) in CONTENT_DIRS {
-        if file_path.starts_with(dir) && file_path.as_bytes().get(dir.len()) == Some(&b'/') {
-            return weight;
+    for dir in &resolved().content_dirs {
+        if file_path.starts_with(dir.path.as_str())
+            && file_path.as_bytes().get(dir.path.len()) == Some(&b'/')
+        {
+            return dir.weight;
         }
     }
     1.0
@@ -455,11 +592,6 @@ mod tests {
     }
 
     // ─── Constants ──────────────────────────────────────────────────
-
-    #[test]
-    fn test_content_dirs_count() {
-        assert_eq!(CONTENT_DIRS.len(), 10);
-    }
 
     #[test]
     fn test_constants() {
@@ -652,40 +784,14 @@ index_root = "/low-root"
     // ─── Pure functions ─────────────────────────────────────────────
 
     #[test]
-    fn test_directory_weight_known() {
-        assert_eq!(directory_weight("company/knowledge/foo.md"), 1.3);
-        assert_eq!(directory_weight("daily/daily/intel/2026-01.md"), 0.7);
-        assert_eq!(directory_weight("company/products/ks.md"), 1.2);
-        assert_eq!(directory_weight("daily/notes/test.md"), 1.0);
-    }
-
-    #[test]
-    fn test_directory_weight_session() {
-        assert_eq!(directory_weight("session:abc123"), SESSION_WEIGHT);
-    }
-
-    #[test]
     fn test_directory_weight_unknown() {
+        // With no content_dirs configured, everything falls through to 1.0
         assert_eq!(directory_weight("unknown/path/file.md"), 1.0);
     }
 
     #[test]
-    fn test_directory_weight_boundary() {
-        assert_eq!(directory_weight("daily/notes_extra/foo.md"), 1.0);
-    }
-
-    #[test]
-    fn test_no_prefix_shadowing() {
-        for (i, &(a, _)) in CONTENT_DIRS.iter().enumerate() {
-            for (j, &(b, _)) in CONTENT_DIRS.iter().enumerate() {
-                if i != j {
-                    assert!(
-                        !b.starts_with(a) || !a.starts_with(b),
-                        "CONTENT_DIRS[{i}]=\"{a}\" and [{j}]=\"{b}\" overlap — reorder longest-first"
-                    );
-                }
-            }
-        }
+    fn test_directory_weight_session() {
+        assert_eq!(directory_weight("session:abc123"), DEFAULT_SESSION_WEIGHT);
     }
 
     #[test]
@@ -699,11 +805,18 @@ index_root = "/low-root"
     }
 
     #[test]
-    fn test_half_life_days_values() {
-        assert_eq!(half_life_days("note"), 120.0);
-        assert_eq!(half_life_days("research"), 60.0);
-        assert_eq!(half_life_days("session"), 30.0);
-        assert_eq!(half_life_days("unknown"), DEFAULT_HALF_LIFE_DAYS);
+    fn test_half_life_days_fallback() {
+        // No content_dirs configured → falls back to source_type-based defaults
+        assert_eq!(half_life_days("daily/notes/test.md", "note"), 120.0);
+        assert_eq!(half_life_days("daily/research/r.md", "research"), 60.0);
+        assert_eq!(
+            half_life_days("session:abc", "session"),
+            DEFAULT_SESSION_HALF_LIFE_DAYS
+        );
+        assert_eq!(
+            half_life_days("unknown/path.md", "unknown"),
+            DEFAULT_HALF_LIFE_DAYS
+        );
     }
 
     #[test]
@@ -893,5 +1006,196 @@ index_root = "/low-root"
         std::env::remove_var("TSM_SEARCH_FALLBACK");
         // Invalid env → falls back to config file value
         assert_eq!(cfg.search_fallback, SearchFallback::FtsOnly);
+    }
+
+    // ─── content_dirs config ────────────────────────────────────────
+
+    #[test]
+    fn test_content_dirs_from_toml() {
+        let cfg = resolved_from_toml(
+            r#"
+[[index.content_dirs]]
+path = "daily/notes"
+weight = 1.2
+half_life_days = 120
+
+[[index.content_dirs]]
+path = "company/knowledge"
+weight = 1.3
+"#,
+        );
+        assert_eq!(cfg.content_dirs.len(), 2);
+        // Sorted longest-first: "company/knowledge" (19) > "daily/notes" (11)
+        assert_eq!(cfg.content_dirs[0].path, "company/knowledge");
+        assert_eq!(cfg.content_dirs[0].weight, 1.3);
+        assert_eq!(cfg.content_dirs[0].half_life_days, DEFAULT_HALF_LIFE_DAYS);
+        assert_eq!(cfg.content_dirs[1].path, "daily/notes");
+        assert_eq!(cfg.content_dirs[1].weight, 1.2);
+        assert_eq!(cfg.content_dirs[1].half_life_days, 120.0);
+    }
+
+    #[test]
+    fn test_content_dirs_defaults_empty() {
+        let cfg = resolved_from_toml("");
+        assert!(cfg.content_dirs.is_empty());
+        assert_eq!(cfg.session_weight, DEFAULT_SESSION_WEIGHT);
+        assert_eq!(cfg.session_half_life_days, DEFAULT_SESSION_HALF_LIFE_DAYS);
+    }
+
+    #[test]
+    fn test_claude_session_from_toml() {
+        let cfg = resolved_from_toml(
+            r#"
+[index.claude_session]
+weight = 0.5
+half_life_days = 14
+"#,
+        );
+        assert_eq!(cfg.session_weight, 0.5);
+        assert_eq!(cfg.session_half_life_days, 14.0);
+    }
+
+    #[test]
+    fn test_content_dirs_weight_defaults() {
+        let cfg = resolved_from_toml(
+            r#"
+[[index.content_dirs]]
+path = "daily/notes"
+"#,
+        );
+        assert_eq!(cfg.content_dirs.len(), 1);
+        assert_eq!(cfg.content_dirs[0].weight, 1.0);
+        assert_eq!(cfg.content_dirs[0].half_life_days, DEFAULT_HALF_LIFE_DAYS);
+    }
+
+    #[test]
+    fn test_content_dirs_prefix_specificity() {
+        // More-specific path should match before shorter prefix
+        let cfg = resolved_from_toml(
+            r#"
+[[index.content_dirs]]
+path = "company"
+weight = 1.0
+
+[[index.content_dirs]]
+path = "company/knowledge"
+weight = 1.5
+"#,
+        );
+        // Sorted longest-first
+        assert_eq!(cfg.content_dirs[0].path, "company/knowledge");
+        assert_eq!(cfg.content_dirs[1].path, "company");
+    }
+
+    #[test]
+    fn test_content_dirs_validation_empty_path_skipped() {
+        let cfg = resolved_from_toml(
+            r#"
+[[index.content_dirs]]
+path = ""
+
+[[index.content_dirs]]
+path = "daily/notes"
+"#,
+        );
+        assert_eq!(cfg.content_dirs.len(), 1);
+        assert_eq!(cfg.content_dirs[0].path, "daily/notes");
+    }
+
+    #[test]
+    fn test_content_dirs_validation_absolute_path_skipped() {
+        let cfg = resolved_from_toml(
+            r#"
+[[index.content_dirs]]
+path = "/etc/passwd"
+
+[[index.content_dirs]]
+path = "daily/notes"
+"#,
+        );
+        assert_eq!(cfg.content_dirs.len(), 1);
+        assert_eq!(cfg.content_dirs[0].path, "daily/notes");
+    }
+
+    #[test]
+    fn test_content_dirs_validation_negative_weight_clamped() {
+        let cfg = resolved_from_toml(
+            r#"
+[[index.content_dirs]]
+path = "daily/notes"
+weight = -1.0
+"#,
+        );
+        assert_eq!(cfg.content_dirs[0].weight, 1.0);
+    }
+
+    #[test]
+    fn test_content_dirs_validation_zero_half_life_clamped() {
+        let cfg = resolved_from_toml(
+            r#"
+[[index.content_dirs]]
+path = "daily/notes"
+half_life_days = 0.0
+"#,
+        );
+        assert_eq!(cfg.content_dirs[0].half_life_days, DEFAULT_HALF_LIFE_DAYS);
+    }
+
+    #[test]
+    fn test_directory_weight_with_config() {
+        let cfg = resolved_from_toml(
+            r#"
+[[index.content_dirs]]
+path = "company/knowledge"
+weight = 1.5
+"#,
+        );
+        // Simulate directory_weight logic against config
+        let file_path = "company/knowledge/foo.md";
+        let weight = cfg
+            .content_dirs
+            .iter()
+            .find(|d| {
+                file_path.starts_with(d.path.as_str())
+                    && file_path.as_bytes().get(d.path.len()) == Some(&b'/')
+            })
+            .map(|d| d.weight)
+            .unwrap_or(1.0);
+        assert_eq!(weight, 1.5);
+
+        // Boundary: similar prefix should NOT match
+        let file_path2 = "company/knowledge_extra/foo.md";
+        let weight2 = cfg
+            .content_dirs
+            .iter()
+            .find(|d| {
+                file_path2.starts_with(d.path.as_str())
+                    && file_path2.as_bytes().get(d.path.len()) == Some(&b'/')
+            })
+            .map(|d| d.weight)
+            .unwrap_or(1.0);
+        assert_eq!(weight2, 1.0);
+    }
+
+    #[test]
+    fn test_half_life_days_with_config() {
+        let cfg = resolved_from_toml(
+            r#"
+[[index.content_dirs]]
+path = "daily/notes"
+half_life_days = 180
+"#,
+        );
+        let file_path = "daily/notes/test.md";
+        let hl = cfg
+            .content_dirs
+            .iter()
+            .find(|d| {
+                file_path.starts_with(d.path.as_str())
+                    && file_path.as_bytes().get(d.path.len()) == Some(&b'/')
+            })
+            .map(|d| d.half_life_days)
+            .unwrap_or(DEFAULT_HALF_LIFE_DAYS);
+        assert_eq!(hl, 180.0);
     }
 }

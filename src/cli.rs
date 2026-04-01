@@ -56,15 +56,115 @@ pub fn read_paths_from_stdin(index_root: &Path) -> Vec<PathBuf> {
 }
 
 pub fn collect_content_files(index_root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for &(dir, _) in config::CONTENT_DIRS {
-        let full_dir = index_root.join(dir);
-        if !full_dir.is_dir() {
-            continue;
+    let dirs = config::content_dirs();
+    if dirs.is_empty() {
+        // Auto-discover: recursively find .md in non-hidden subdirs of index_root
+        let mut files = Vec::new();
+        for subdir in discover_subdirs(index_root) {
+            collect_md_files_excluding_hidden(&subdir, &mut files);
         }
-        collect_md_files(&full_dir, &mut files);
+        files
+    } else {
+        let mut files = Vec::new();
+        for dir in dirs {
+            let full_dir = index_root.join(&dir.path);
+            if full_dir.is_dir() {
+                collect_md_files(&full_dir, &mut files);
+            } else {
+                log::warn!(
+                    "content_dir '{}' not found at {}; skipping",
+                    dir.path,
+                    full_dir.display()
+                );
+            }
+        }
+        files
     }
-    files
+}
+
+fn collect_md_files_excluding_hidden(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            log::warn!("cannot read directory {}: {e}", dir.display());
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                log::warn!("cannot read entry in {}: {e}", dir.display());
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.') {
+                continue;
+            }
+            collect_md_files_excluding_hidden(&path, out);
+        } else if path.extension().is_some_and(|e| e == "md") {
+            out.push(path);
+        }
+    }
+}
+
+/// Discover immediate non-hidden subdirectories of a directory.
+fn discover_subdirs(dir: &Path) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    match std::fs::read_dir(dir) {
+        Err(e) => {
+            log::warn!(
+                "cannot read {}: {e}; no subdirectories discovered",
+                dir.display()
+            );
+        }
+        Ok(entries) => {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => {
+                        log::warn!("cannot read entry in {}: {e}", dir.display());
+                        continue;
+                    }
+                };
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if !name.starts_with('.') {
+                        result.push(path);
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// List directories to watch (for tsm-watcher). When content_dirs is configured,
+/// returns those paths. Otherwise discovers non-hidden subdirs under index_root.
+pub fn discover_watch_dirs(index_root: &Path) -> Vec<PathBuf> {
+    let dirs = config::content_dirs();
+    if dirs.is_empty() {
+        discover_subdirs(index_root)
+    } else {
+        let mut result = Vec::new();
+        for dir in dirs {
+            let full_dir = index_root.join(&dir.path);
+            if full_dir.is_dir() {
+                result.push(full_dir);
+            } else {
+                log::warn!(
+                    "content_dir '{}' not found at {}; will not be watched",
+                    dir.path,
+                    full_dir.display()
+                );
+            }
+        }
+        result
+    }
 }
 
 pub fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -1546,5 +1646,44 @@ mod tests {
         assert_eq!(parsed["issue_count"], 0);
         assert_eq!(parsed["sections"][0]["name"], "Test");
         assert_eq!(parsed["sections"][0]["items"][0]["status"], "ok");
+    }
+
+    #[test]
+    fn test_discover_subdirs_excludes_hidden() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("visible")).unwrap();
+        std::fs::create_dir(dir.path().join(".hidden")).unwrap();
+        std::fs::create_dir(dir.path().join("another")).unwrap();
+
+        let dirs = super::discover_subdirs(dir.path());
+        let names: Vec<&str> = dirs
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+        assert!(names.contains(&"visible"));
+        assert!(names.contains(&"another"));
+        assert!(!names.contains(&".hidden"));
+    }
+
+    #[test]
+    fn test_collect_md_files_excluding_hidden() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let visible = dir.path().join("visible");
+        std::fs::create_dir(&visible).unwrap();
+        std::fs::write(visible.join("note.md"), "# Note").unwrap();
+
+        let hidden = dir.path().join(".hidden");
+        std::fs::create_dir(&hidden).unwrap();
+        std::fs::write(hidden.join("secret.md"), "# Secret").unwrap();
+
+        let mut files = Vec::new();
+        super::collect_md_files_excluding_hidden(dir.path(), &mut files);
+
+        let names: Vec<&str> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+        assert!(names.contains(&"note.md"));
+        assert!(!names.contains(&"secret.md"));
     }
 }

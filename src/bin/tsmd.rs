@@ -15,7 +15,9 @@ use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
 use the_space_memory::cli;
 use the_space_memory::config;
 use the_space_memory::daemon;
-use the_space_memory::daemon_protocol::{read_request, write_response, DaemonRequest, DaemonResponse};
+use the_space_memory::daemon_protocol::{
+    read_request, write_response, DaemonRequest, DaemonResponse,
+};
 use the_space_memory::db;
 use the_space_memory::status;
 
@@ -548,7 +550,9 @@ fn sleep_interruptible(duration: std::time::Duration) {
 /// and indexes them directly via the shared DB connection.
 /// Set up watch targets and return the set of watched directories.
 fn setup_watches(
-    debouncer: &mut notify_debouncer_mini::Debouncer<notify_debouncer_mini::notify::RecommendedWatcher>,
+    debouncer: &mut notify_debouncer_mini::Debouncer<
+        notify_debouncer_mini::notify::RecommendedWatcher,
+    >,
     index_root: &Path,
 ) -> HashSet<PathBuf> {
     let mut watched = HashSet::new();
@@ -569,7 +573,9 @@ fn setup_watches(
 
 /// Update watch targets: unwatch removed dirs, watch added dirs.
 fn update_watches(
-    debouncer: &mut notify_debouncer_mini::Debouncer<notify_debouncer_mini::notify::RecommendedWatcher>,
+    debouncer: &mut notify_debouncer_mini::Debouncer<
+        notify_debouncer_mini::notify::RecommendedWatcher,
+    >,
     current: &mut HashSet<PathBuf>,
     index_root: &Path,
 ) {
@@ -589,10 +595,7 @@ fn update_watches(
     // Watch new dirs
     for dir in desired.difference(current) {
         log::info!("watching {}", dir.display());
-        if let Err(e) = debouncer
-            .watcher()
-            .watch(dir, RecursiveMode::Recursive)
-        {
+        if let Err(e) = debouncer.watcher().watch(dir, RecursiveMode::Recursive) {
             log::warn!("cannot watch {}: {e}", dir.display());
         }
     }

@@ -90,7 +90,7 @@ impl Embedder {
             .map(|t| {
                 if t.len() > MAX_CHARS {
                     let mut end = MAX_CHARS;
-                    while !t.is_char_boundary(end) {
+                    while end > 0 && !t.is_char_boundary(end) {
                         end -= 1;
                     }
                     t[..end].to_string()

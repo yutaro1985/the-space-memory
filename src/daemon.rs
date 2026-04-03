@@ -127,6 +127,18 @@ pub fn handle_request(
         DaemonRequest::Rebuild { .. } => {
             DaemonResponse::error("rebuild cannot run while tsmd is active. Run `tsm stop` first.")
         }
+
+        // In the live daemon, tsmd::handle_client intercepts Reload first
+        // (to access the watcher channel). This arm handles the same logic
+        // for callers without a watcher, including unit tests.
+        DaemonRequest::Reload => {
+            let warnings = config::reload();
+            if warnings.is_empty() {
+                DaemonResponse::success_empty()
+            } else {
+                DaemonResponse::success(serde_json::json!({ "warnings": warnings }))
+            }
+        }
     }
 }
 
@@ -278,6 +290,16 @@ mod tests {
         let resp = handle_request(&conn, req, dir.path(), &flag);
         assert!(!resp.ok);
         assert!(resp.error.unwrap().contains("tsm stop"));
+    }
+
+    #[test]
+    fn test_reload() {
+        let (conn, dir) = setup();
+        let flag = AtomicBool::new(false);
+        let resp = handle_request(&conn, DaemonRequest::Reload, dir.path(), &flag);
+        assert!(resp.ok);
+        // Shutdown flag should NOT be set by reload
+        assert!(!flag.load(Ordering::SeqCst));
     }
 
     #[test]

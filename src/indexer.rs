@@ -31,15 +31,25 @@ pub struct BackfillStats {
     pub last_id: i64,
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            use std::fmt::Write;
+            write!(s, "{b:02x}").unwrap();
+            s
+        })
+}
+
 fn file_hash(path: &Path) -> anyhow::Result<String> {
     let data = std::fs::read(path)?;
     let hash = Sha256::digest(&data);
-    Ok(format!("{hash:x}"))
+    Ok(hex_encode(hash.as_slice()))
 }
 
 fn chunk_hash(content: &str) -> String {
     let hash = Sha256::digest(content.as_bytes());
-    format!("{hash:x}")
+    hex_encode(hash.as_slice())
 }
 
 fn directory_from_rel_path(rel_path: &str) -> String {
@@ -990,6 +1000,20 @@ mod tests {
         let mut f = std::fs::File::create(&full).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         full
+    }
+
+    #[test]
+    fn test_hex_encode() {
+        assert_eq!(hex_encode(&[]), "");
+        assert_eq!(hex_encode(&[0x00]), "00");
+        assert_eq!(hex_encode(&[0xff]), "ff");
+        assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+        // SHA-256 of empty input
+        let hash = Sha256::digest(b"");
+        assert_eq!(
+            hex_encode(hash.as_slice()),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]

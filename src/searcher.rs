@@ -127,10 +127,14 @@ pub fn search(
         Some(prefixes) if !prefixes.is_empty() => {
             let conditions: Vec<String> = prefixes
                 .iter()
-                .map(|_| "d.file_path LIKE ?".to_string())
+                .map(|_| "d.file_path LIKE ? ESCAPE '\\'".to_string())
                 .collect();
             for p in prefixes {
-                extra_params.push(Box::new(format!("{}%", p)));
+                let escaped = p
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
+                extra_params.push(Box::new(format!("{}%", escaped)));
             }
             format!(" AND ({})", conditions.join(" OR "))
         }
@@ -888,6 +892,82 @@ mod tests {
         assert!(!results.is_empty());
         for r in &results {
             assert_eq!(r.source_file, "docs/api.md");
+        }
+    }
+
+    #[test]
+    fn test_search_path_filter_escapes_like_metacharacters() {
+        use crate::indexer;
+        use std::io::Write;
+
+        let conn = db::get_memory_connection().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Create files: one with underscore, one without
+        for (rel, title) in [
+            ("daily_notes/mtg.md", "Daily Notes MTG"),
+            ("dailyXnotes/mtg.md", "DailyX Notes MTG"),
+        ] {
+            let md =
+                format!("---\nstatus: current\n---\n\n# {title}\n\nMTG content for testing.\n");
+            let full = dir.path().join(rel);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            let mut f = std::fs::File::create(&full).unwrap();
+            f.write_all(md.as_bytes()).unwrap();
+            indexer::index_file(&conn, &full, dir.path()).unwrap();
+        }
+
+        // _ in path must be literal, not a wildcard
+        let paths = vec!["daily_notes/".to_string()];
+        let results = search(&conn, "MTG", 10, None, false, Some(&paths)).unwrap();
+        assert!(!results.is_empty());
+        for r in &results {
+            assert!(
+                r.source_file.starts_with("daily_notes/"),
+                "Expected daily_notes/ prefix, got: {}",
+                r.source_file
+            );
+        }
+    }
+
+    #[test]
+    fn test_search_path_filter_with_time_filter() {
+        use crate::indexer;
+        use crate::temporal::TimeFilter;
+        use std::io::Write;
+
+        let conn = db::get_memory_connection().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        for (rel, date) in [
+            ("daily/recent.md", today.as_str()),
+            ("daily/old.md", "2020-01-01"),
+            ("projects/recent.md", today.as_str()),
+        ] {
+            let md = format!(
+                "---\nstatus: current\nupdated: {date}\n---\n\n# MTG\n\nMTG content here.\n"
+            );
+            let full = dir.path().join(rel);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            let mut f = std::fs::File::create(&full).unwrap();
+            f.write_all(md.as_bytes()).unwrap();
+            indexer::index_file(&conn, &full, dir.path()).unwrap();
+        }
+
+        // Combine path filter + time filter
+        let paths = vec!["daily/".to_string()];
+        let filter = TimeFilter {
+            after: Some("2025-01-01".to_string()),
+            before: None,
+        };
+        let results = search(&conn, "MTG", 10, Some(&filter), false, Some(&paths)).unwrap();
+        for r in &results {
+            assert!(
+                r.source_file.starts_with("daily/"),
+                "Expected daily/ prefix, got: {}",
+                r.source_file
+            );
         }
     }
 

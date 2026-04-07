@@ -195,6 +195,34 @@ mod tests {
     }
 
     #[test]
+    fn serde_roundtrip_search_with_paths() {
+        let req = DaemonRequest::Search {
+            query: "MTG".into(),
+            top_k: 5,
+            format: "json".into(),
+            include_content: None,
+            after: None,
+            before: None,
+            recent: None,
+            year: None,
+            fallback: None,
+            paths: Some(vec!["daily/".into(), "projects/".into()]),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"paths\""));
+        let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
+        match decoded {
+            DaemonRequest::Search { paths, .. } => {
+                assert_eq!(
+                    paths,
+                    Some(vec!["daily/".to_string(), "projects/".to_string()])
+                );
+            }
+            _ => panic!("Expected Search variant"),
+        }
+    }
+
+    #[test]
     fn serde_roundtrip_index() {
         let req = DaemonRequest::Index {
             files: vec!["daily/notes/test.md".into()],

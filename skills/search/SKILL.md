@@ -1,5 +1,5 @@
 ---
-name: search
+name: the-space-memory:search
 description: Search the cross-workspace knowledge base using hybrid FTS5 + vector search.
 user-invocable: true
 ---

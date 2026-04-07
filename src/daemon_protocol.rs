@@ -26,6 +26,8 @@ pub enum DaemonRequest {
         year: Option<i32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         fallback: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        paths: Option<Vec<String>>,
     },
     Index {
         files: Vec<String>,
@@ -171,6 +173,7 @@ mod tests {
             recent: None,
             year: None,
             fallback: None,
+            paths: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
@@ -186,6 +189,34 @@ mod tests {
                 assert_eq!(top_k, 5);
                 assert_eq!(include_content, Some(3));
                 assert_eq!(before, Some("2026-01-01".into()));
+            }
+            _ => panic!("Expected Search variant"),
+        }
+    }
+
+    #[test]
+    fn serde_roundtrip_search_with_paths() {
+        let req = DaemonRequest::Search {
+            query: "MTG".into(),
+            top_k: 5,
+            format: "json".into(),
+            include_content: None,
+            after: None,
+            before: None,
+            recent: None,
+            year: None,
+            fallback: None,
+            paths: Some(vec!["daily/".into(), "projects/".into()]),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"paths\""));
+        let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
+        match decoded {
+            DaemonRequest::Search { paths, .. } => {
+                assert_eq!(
+                    paths,
+                    Some(vec!["daily/".to_string(), "projects/".to_string()])
+                );
             }
             _ => panic!("Expected Search variant"),
         }
@@ -376,6 +407,7 @@ mod tests {
             recent: None,
             year: None,
             fallback: None,
+            paths: None,
         };
         let req_bytes = serde_json::to_vec(&req).unwrap();
         let mut buf = Vec::new();

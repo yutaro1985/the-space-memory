@@ -34,6 +34,7 @@ pub fn handle_request(
             recent,
             year,
             fallback,
+            paths,
         } => {
             let opts = cli::SearchOptions {
                 query: &query,
@@ -45,6 +46,7 @@ pub fn handle_request(
                 recent: recent.as_deref(),
                 year,
                 fallback: fallback.as_deref(),
+                paths: paths.as_deref(),
             };
             match cli::run_search(conn, &opts) {
                 Ok(results) => {
@@ -181,6 +183,7 @@ mod tests {
             recent: None,
             year: None,
             fallback: Some("fts_only".into()),
+            paths: None,
         };
         let resp = handle_request(&conn, req, dir.path(), &flag);
         assert!(resp.ok);
@@ -188,6 +191,61 @@ mod tests {
         let payload = resp.payload.unwrap();
         assert!(payload.is_array());
         assert_eq!(payload.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_search_with_path_filter() {
+        let (conn, dir) = setup();
+        let flag = AtomicBool::new(false);
+
+        // Create files in two directories
+        let daily_dir = dir.path().join("daily/notes");
+        std::fs::create_dir_all(&daily_dir).unwrap();
+        std::fs::write(
+            daily_dir.join("mtg.md"),
+            "---\nstatus: current\n---\n\n# MTG\n\nMTG meeting notes.\n",
+        )
+        .unwrap();
+
+        let projects_dir = dir.path().join("projects/tsm");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        std::fs::write(
+            projects_dir.join("mtg.md"),
+            "---\nstatus: current\n---\n\n# MTG\n\nMTG project notes.\n",
+        )
+        .unwrap();
+
+        // Index both files
+        let req = DaemonRequest::Index {
+            files: vec!["daily/notes/mtg.md".into(), "projects/tsm/mtg.md".into()],
+        };
+        let resp = handle_request(&conn, req, dir.path(), &flag);
+        assert!(resp.ok);
+
+        // Search with path filter
+        let req = DaemonRequest::Search {
+            query: "MTG".into(),
+            top_k: 10,
+            format: "json".into(),
+            include_content: None,
+            after: None,
+            before: None,
+            recent: None,
+            year: None,
+            fallback: Some("fts_only".into()),
+            paths: Some(vec!["daily/".into()]),
+        };
+        let resp = handle_request(&conn, req, dir.path(), &flag);
+        assert!(resp.ok);
+        let results = resp.payload.unwrap();
+        let arr = results.as_array().unwrap();
+        for item in arr {
+            let path = item["source_file"].as_str().unwrap();
+            assert!(
+                path.starts_with("daily/"),
+                "Expected daily/ prefix, got: {path}"
+            );
+        }
     }
 
     #[test]
@@ -407,6 +465,7 @@ mod tests {
                 recent: None,
                 year: None,
                 fallback: Some("fts_only".into()),
+                paths: None,
             },
         )
         .unwrap();

@@ -121,6 +121,9 @@ enum Commands {
         /// Embedder fallback mode: error (default) or fts_only
         #[arg(long, value_enum)]
         fallback: Option<SearchFallbackArg>,
+        /// Filter by path prefix (can be specified multiple times, OR combined)
+        #[arg(long = "path")]
+        paths: Vec<String>,
     },
     /// Ingest a session JSONL file
     IngestSession {
@@ -223,6 +226,7 @@ fn main() -> anyhow::Result<()> {
             recent,
             year,
             fallback,
+            paths,
         } => {
             // Always resolve fallback so the daemon uses the CLI caller's config
             let fallback = Some(
@@ -230,6 +234,17 @@ fn main() -> anyhow::Result<()> {
                     .map(|f| f.to_string())
                     .unwrap_or_else(|| config::search_fallback().to_string()),
             );
+            for p in &paths {
+                if p.is_empty() {
+                    anyhow::bail!("--path cannot be empty");
+                }
+                if std::path::Path::new(p).is_absolute() {
+                    anyhow::bail!(
+                        "--path must be a relative path (e.g. 'daily/'), got absolute: {p}"
+                    );
+                }
+            }
+            let paths = if paths.is_empty() { None } else { Some(paths) };
             let req = DaemonRequest::Search {
                 query,
                 top_k,
@@ -240,6 +255,7 @@ fn main() -> anyhow::Result<()> {
                 recent,
                 year,
                 fallback,
+                paths,
             };
             render_search(send_to_daemon(&req)?, &format)?;
         }

@@ -35,6 +35,7 @@ pub fn search(
     top_k: usize,
     time_filter: Option<&TimeFilter>,
     require_vector: bool,
+    path_prefixes: Option<&[String]>,
 ) -> anyhow::Result<Vec<SearchResult>> {
     // Query preprocessing: extract meaningful keywords, skip noise-only queries
     let keywords = extract_search_keywords(query);
@@ -122,12 +123,26 @@ pub fn search(
         format!(" AND {}", time_clauses.join(" AND "))
     };
 
+    let path_sql = match path_prefixes {
+        Some(prefixes) if !prefixes.is_empty() => {
+            let conditions: Vec<String> = prefixes
+                .iter()
+                .map(|_| "d.file_path LIKE ?".to_string())
+                .collect();
+            for p in prefixes {
+                extra_params.push(Box::new(format!("{}%", p)));
+            }
+            format!(" AND ({})", conditions.join(" OR "))
+        }
+        _ => String::new(),
+    };
+
     let sql = format!(
         "SELECT c.id AS chunk_id, c.section_path, c.content,
                 d.file_path, d.source_type, d.status, d.updated
          FROM chunks c
          JOIN documents d ON c.document_id = d.id
-         WHERE c.id IN ({placeholders}){time_sql}"
+         WHERE c.id IN ({placeholders}){time_sql}{path_sql}"
     );
 
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = all_chunk_ids
@@ -539,7 +554,7 @@ mod tests {
         indexer::index_file(&conn, &full, dir.path()).unwrap();
 
         // Search should find it
-        let results = search(&conn, "射撃", 5, None, false).unwrap();
+        let results = search(&conn, "射撃", 5, None, false, None).unwrap();
         assert!(!results.is_empty());
         assert!(results[0].source_file.contains("shooting"));
         assert!(results[0].score > 0.0);
@@ -549,14 +564,14 @@ mod tests {
     #[test]
     fn test_search_empty_query() {
         let conn = db::get_memory_connection().unwrap();
-        let results = search(&conn, "", 5, None, false).unwrap();
+        let results = search(&conn, "", 5, None, false, None).unwrap();
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_search_no_results() {
         let conn = db::get_memory_connection().unwrap();
-        let results = search(&conn, "存在しないキーワード", 5, None, false).unwrap();
+        let results = search(&conn, "存在しないキーワード", 5, None, false, None).unwrap();
         assert!(results.is_empty());
     }
 
@@ -581,7 +596,7 @@ mod tests {
             indexer::index_file(&conn, &full, dir.path()).unwrap();
         }
 
-        let results = search(&conn, "テスト", 3, None, false).unwrap();
+        let results = search(&conn, "テスト", 3, None, false, None).unwrap();
         assert!(results.len() <= 3);
     }
 
@@ -609,7 +624,7 @@ mod tests {
             after: Some("2020-01-01".to_string()),
             before: Some("2099-01-01".to_string()),
         };
-        let results = search(&conn, "射撃", 5, Some(&filter), false).unwrap();
+        let results = search(&conn, "射撃", 5, Some(&filter), false, None).unwrap();
         assert!(!results.is_empty());
     }
 
@@ -637,7 +652,7 @@ mod tests {
             after: Some("2099-01-01".to_string()),
             before: None,
         };
-        let results = search(&conn, "射撃", 5, Some(&filter), false).unwrap();
+        let results = search(&conn, "射撃", 5, Some(&filter), false, None).unwrap();
         assert!(results.is_empty());
     }
 
@@ -661,7 +676,7 @@ mod tests {
             after: Some("2025-01-01".to_string()),
             before: None,
         };
-        let results = search(&conn, "射撃", 5, Some(&filter), false).unwrap();
+        let results = search(&conn, "射撃", 5, Some(&filter), false, None).unwrap();
         assert!(!results.is_empty());
     }
 
@@ -693,7 +708,7 @@ mod tests {
     fn test_search_noise_query_returns_empty() {
         let conn = db::get_memory_connection().unwrap();
         // Pure interjection/greeting should return empty results
-        let results = search(&conn, "よかったーーー", 5, None, false).unwrap();
+        let results = search(&conn, "よかったーーー", 5, None, false, None).unwrap();
         assert!(
             results.is_empty(),
             "Noise query should return empty results"
@@ -703,7 +718,7 @@ mod tests {
     #[test]
     fn test_search_stopword_query_returns_empty() {
         let conn = db::get_memory_connection().unwrap();
-        let results = search(&conn, "なるほど", 5, None, false).unwrap();
+        let results = search(&conn, "なるほど", 5, None, false, None).unwrap();
         assert!(
             results.is_empty(),
             "Stopword-only query should return empty results"
@@ -727,8 +742,153 @@ mod tests {
         indexer::index_file(&conn, &full, dir.path()).unwrap();
 
         // A meaningful query should still find results
-        let results = search(&conn, "LoRaモジュール", 5, None, false).unwrap();
+        let results = search(&conn, "LoRaモジュール", 5, None, false, None).unwrap();
         assert!(!results.is_empty(), "Meaningful query should find results");
+    }
+
+    #[test]
+    fn test_search_with_path_filter_includes() {
+        use crate::indexer;
+        use std::io::Write;
+
+        let conn = db::get_memory_connection().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Create files in different directories
+        let daily_md = "---\nstatus: current\n---\n\n# MTG Notes\n\nMTG meeting notes content.\n";
+        let daily_path = dir.path().join("daily/notes/mtg.md");
+        std::fs::create_dir_all(daily_path.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(&daily_path).unwrap();
+        f.write_all(daily_md.as_bytes()).unwrap();
+
+        let project_md =
+            "---\nstatus: current\n---\n\n# Project MTG\n\nMTG project documentation.\n";
+        let project_path = dir.path().join("projects/tsm/mtg.md");
+        std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(&project_path).unwrap();
+        f.write_all(project_md.as_bytes()).unwrap();
+
+        indexer::index_file(&conn, &daily_path, dir.path()).unwrap();
+        indexer::index_file(&conn, &project_path, dir.path()).unwrap();
+
+        // Filter to daily/ only
+        let paths = vec!["daily/".to_string()];
+        let results = search(&conn, "MTG", 5, None, false, Some(&paths)).unwrap();
+        assert!(!results.is_empty());
+        for r in &results {
+            assert!(
+                r.source_file.starts_with("daily/"),
+                "Expected daily/ prefix, got: {}",
+                r.source_file
+            );
+        }
+    }
+
+    #[test]
+    fn test_search_with_path_filter_excludes() {
+        use crate::indexer;
+        use std::io::Write;
+
+        let conn = db::get_memory_connection().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let md = "---\nstatus: current\n---\n\n# MTG Notes\n\nMTG meeting notes.\n";
+        let path = dir.path().join("daily/notes/mtg.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(md.as_bytes()).unwrap();
+        indexer::index_file(&conn, &path, dir.path()).unwrap();
+
+        // Filter to projects/ — should exclude daily/
+        let paths = vec!["projects/".to_string()];
+        let results = search(&conn, "MTG", 5, None, false, Some(&paths)).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_with_multiple_path_filters() {
+        use crate::indexer;
+        use std::io::Write;
+
+        let conn = db::get_memory_connection().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        for (rel, title) in [
+            ("daily/notes/mtg.md", "Daily MTG"),
+            ("projects/tsm/mtg.md", "Project MTG"),
+            ("docs/api.md", "API MTG"),
+        ] {
+            let md =
+                format!("---\nstatus: current\n---\n\n# {title}\n\nMTG content for searching.\n");
+            let full = dir.path().join(rel);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            let mut f = std::fs::File::create(&full).unwrap();
+            f.write_all(md.as_bytes()).unwrap();
+            indexer::index_file(&conn, &full, dir.path()).unwrap();
+        }
+
+        // Filter to daily/ and docs/ (OR)
+        let paths = vec!["daily/".to_string(), "docs/".to_string()];
+        let results = search(&conn, "MTG", 10, None, false, Some(&paths)).unwrap();
+        assert!(!results.is_empty());
+        for r in &results {
+            assert!(
+                r.source_file.starts_with("daily/") || r.source_file.starts_with("docs/"),
+                "Unexpected path: {}",
+                r.source_file
+            );
+        }
+    }
+
+    #[test]
+    fn test_search_with_no_path_filter_returns_all() {
+        use crate::indexer;
+        use std::io::Write;
+
+        let conn = db::get_memory_connection().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        for rel in ["daily/notes/mtg.md", "projects/tsm/mtg.md"] {
+            let md = "---\nstatus: current\n---\n\n# MTG Notes\n\nMTG meeting content.\n";
+            let full = dir.path().join(rel);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            let mut f = std::fs::File::create(&full).unwrap();
+            f.write_all(md.as_bytes()).unwrap();
+            indexer::index_file(&conn, &full, dir.path()).unwrap();
+        }
+
+        // No path filter — should return results from both directories
+        let results = search(&conn, "MTG", 10, None, false, None).unwrap();
+        assert!(results.len() >= 2);
+    }
+
+    #[test]
+    fn test_search_with_file_path_filter() {
+        use crate::indexer;
+        use std::io::Write;
+
+        let conn = db::get_memory_connection().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        for rel in ["docs/api.md", "docs/guide.md"] {
+            let md = format!(
+                "---\nstatus: current\n---\n\n# Auth\n\nAuthentication details for {}.\n",
+                rel
+            );
+            let full = dir.path().join(rel);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            let mut f = std::fs::File::create(&full).unwrap();
+            f.write_all(md.as_bytes()).unwrap();
+            indexer::index_file(&conn, &full, dir.path()).unwrap();
+        }
+
+        // Filter to a specific file
+        let paths = vec!["docs/api.md".to_string()];
+        let results = search(&conn, "Authentication", 10, None, false, Some(&paths)).unwrap();
+        assert!(!results.is_empty());
+        for r in &results {
+            assert_eq!(r.source_file, "docs/api.md");
+        }
     }
 
     #[test]
@@ -750,7 +910,7 @@ mod tests {
         let _ = conn.execute("DELETE FROM dictionary_candidates", []);
 
         // Search should collect query candidates
-        let _ = search(&conn, "candle framework", 5, None, false);
+        let _ = search(&conn, "candle framework", 5, None, false, None);
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM dictionary_candidates", [], |r| {

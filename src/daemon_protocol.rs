@@ -26,6 +26,8 @@ pub enum DaemonRequest {
         year: Option<i32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         fallback: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        paths: Option<Vec<String>>,
     },
     Index {
         files: Vec<String>,
@@ -171,6 +173,7 @@ mod tests {
             recent: None,
             year: None,
             fallback: None,
+            paths: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
@@ -376,6 +379,7 @@ mod tests {
             recent: None,
             year: None,
             fallback: None,
+            paths: None,
         };
         let req_bytes = serde_json::to_vec(&req).unwrap();
         let mut buf = Vec::new();

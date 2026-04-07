@@ -192,6 +192,7 @@ pub struct SearchOptions<'a> {
     pub recent: Option<&'a str>,
     pub year: Option<i32>,
     pub fallback: Option<&'a str>,
+    pub paths: Option<&'a [String]>,
 }
 
 /// Run search and return structured results (no DB open, no output).
@@ -233,6 +234,7 @@ pub fn run_search(
         opts.top_k,
         filter.as_ref(),
         require_vector,
+        opts.paths,
     )
 }
 

@@ -1,5 +1,5 @@
 ---
-name: doctor
+name: the-space-memory:doctor
 description: Run health checks on The Space Memory daemon, embedder, and database.
 user-invocable: true
 ---

@@ -135,6 +135,18 @@ src/
 - Embedder tests should use mockable trait design
 - Tests must not depend on external daemon state (embedder, etc.)
 
+## Branch Naming
+
+Branch names must follow `<type>/<description>` format.
+The PR labeler workflow (`.github/labeler.yml`) maps prefixes to labels:
+
+| Prefix | Label |
+|---|---|
+| `feat/` | enhancement |
+| `fix/` | bug |
+| `docs/` | documentation |
+| `perf/` | performance |
+
 ## Build & Deploy
 
 Build from a host container via Docker, then reference the binary from hooks/skills.

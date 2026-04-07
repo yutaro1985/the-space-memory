@@ -43,7 +43,7 @@ cd "$CLAUDE_PROJECT_DIR" && "${CLAUDE_PLUGIN_ROOT}/bin/tsm" search -q "$ARGUMENT
 
 Parse the JSON results and present them like this:
 
-```
+```text
 ### Knowledge Search: "<query>"
 
 1. **[Section Title]** — `source/file.md`

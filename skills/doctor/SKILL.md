@@ -26,7 +26,7 @@ cd "$CLAUDE_PROJECT_DIR" && "${CLAUDE_PLUGIN_ROOT}/bin/tsm" doctor -f json
 
 Parse the JSON and present like this:
 
-```
+```text
 ### The Space Memory — Doctor
 
 ✔ Daemon: running (pid 1234)

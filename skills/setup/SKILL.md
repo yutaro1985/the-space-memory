@@ -36,6 +36,7 @@ Then ask:
 Ask:
 
 > When the embedder (vector search) is down, how should search behave?
+>
 > 1. **error** — Refuse to search (default, recommended)
 > 2. **fts_only** — Fall back to text-only search
 
@@ -45,11 +46,13 @@ Ask:
 
 > Should Claude Code session history be indexed for search?
 > (This lets you search past conversations)
+>
 > - **yes** (default) — Index sessions with weight 0.3
 > - **no** — Skip session indexing
 
-3. Generate `tsm.toml` from the answers and write it
-4. Show the generated config and suggest:
+## After Questions
+
+Generate `tsm.toml` from the answers, write it, and suggest:
 
 ```bash
 tsm rebuild --force   # Initial index build

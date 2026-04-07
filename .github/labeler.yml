@@ -9,3 +9,6 @@ documentation:
 
 performance:
   - head-branch: ['^perf/']
+
+dependencies:
+  - head-branch: ['^dependabot/']

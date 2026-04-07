@@ -48,6 +48,8 @@ jobs:
 
       - name: Build release binaries (cross)
         if: matrix.use_cross
+        env:
+          RUSTFLAGS: "-C target-feature=+fp16"
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Build release binaries

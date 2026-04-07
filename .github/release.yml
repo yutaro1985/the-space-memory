@@ -19,6 +19,10 @@ changelog:
     - title: "Documentation"
       labels:
         - documentation
+    - title: "House Keeping"
+      labels:
+        - chore
+        - dependencies
     - title: "Other Changes"
       labels:
         - "*"

@@ -12,3 +12,6 @@ performance:
 
 dependencies:
   - head-branch: ['^dependabot/']
+
+chore:
+  - head-branch: ['^chore/']

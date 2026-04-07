@@ -34,7 +34,23 @@ cd "$CLAUDE_PROJECT_DIR" && "${CLAUDE_PLUGIN_ROOT}bin/tsm" search -q "$ARGUMENTS
 
 ## Behavior
 
-1. If `$ARGUMENTS` is provided, use it as the query directly
-2. If no arguments, infer the query from the conversation context
-3. Run the search and present results with source file paths
+1. If `$ARGUMENTS` is empty, do nothing — do not guess or infer a query
+2. Run the search with the provided query
+3. Present results using the format below
 4. For deeper investigation, delegate to the `deep-research` agent
+
+## Output Format
+
+Parse the JSON results and present them like this:
+
+```
+### ナレッジ検索結果: "<query>"
+
+1. **[Section Title]** — `source/file.md`
+   > snippet of matching content...
+
+2. **[Section Title]** — `source/file.md`
+   > snippet of matching content...
+
+_N件ヒット。詳しく調べるなら deep-research エージェントに委任できるよ。_
+```

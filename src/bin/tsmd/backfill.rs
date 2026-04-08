@@ -24,6 +24,21 @@ impl Drop for SearchActiveGuard {
     }
 }
 
+/// Spin-wait until no search requests are in-flight, checking SHUTDOWN.
+/// Returns `true` if shutdown was requested during the wait.
+fn yield_to_search(search_active: &Arc<AtomicUsize>) -> bool {
+    for _ in 0..200 {
+        if search_active.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
 // ─── Backfill ───────────────────────────────────────────────────────
 
 /// Run one full backfill pass, releasing the DB lock between batches
@@ -45,15 +60,8 @@ pub fn run_backfill_pass(
             break;
         }
 
-        // Yield while search requests are in-flight (no lock held)
-        for _ in 0..200 {
-            if search_active.load(Ordering::Acquire) == 0 {
-                break;
-            }
-            if SHUTDOWN.load(Ordering::SeqCst) {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        if yield_to_search(search_active) {
+            return;
         }
 
         // Lock DB only for this one batch
@@ -187,16 +195,7 @@ pub fn run_reindex_fts_pass(
             break;
         }
 
-        // Yield while search requests are in-flight
-        for _ in 0..200 {
-            if search_active.load(Ordering::Acquire) == 0 {
-                break;
-            }
-            if SHUTDOWN.load(Ordering::SeqCst) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        yield_to_search(search_active);
 
         let Ok(conn) = conn.lock() else {
             log::error!(
@@ -260,15 +259,8 @@ pub fn run_reindex_vectors_pass(
     search_active: &Arc<AtomicUsize>,
     state_dir: &Path,
 ) {
-    // Yield while search requests are in-flight before clearing
-    for _ in 0..200 {
-        if search_active.load(Ordering::Acquire) == 0 {
-            break;
-        }
-        if SHUTDOWN.load(Ordering::SeqCst) {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    if yield_to_search(search_active) {
+        return;
     }
 
     // Get total chunk count and clear vector tables (short lock)

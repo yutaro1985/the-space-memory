@@ -766,7 +766,7 @@ fn doctor_check_with_conn(
         } else {
             0
         };
-        let processed = ri.processed as usize + ri.errors;
+        let processed = (ri.processed + ri.errors) as usize;
         let eta = if processed > 0 && ri.total > 0 {
             estimate_eta(&ri.started_at, processed, ri.total as usize)
         } else {
@@ -1153,25 +1153,15 @@ pub fn cmd_dict_update(threshold: i64, apply: bool) -> anyhow::Result<()> {
     // Rebuild FTS: if daemon is running, send reindex via IPC (daemon resets
     // its own segmenter). Otherwise, reset locally and rebuild directly.
     let daemon_socket = config::daemon_socket_path();
-    if let Some(Ok(resp)) = crate::daemon_protocol::try_send_request(
-        &daemon_socket,
-        &crate::daemon_protocol::DaemonRequest::Ping,
-    ) {
-        if resp.ok {
-            log::info!("\nSending FTS reindex to daemon...");
-            let req = crate::daemon_protocol::DaemonRequest::Reindex {
-                kind: crate::daemon_protocol::ReindexKind::Fts,
-            };
-            let resp = crate::daemon_protocol::send_request(&daemon_socket, &req)?;
-            if !resp.ok {
-                anyhow::bail!("Daemon reindex failed: {}", resp.error.unwrap_or_default());
-            }
-            log::info!("FTS reindex started in background. Run `tsm doctor` to check progress.");
-        } else {
-            crate::tokenizer::reset_segmenter();
-            log::info!("\nRebuilding FTS index...");
-            cmd_rebuild_fts()?;
-        }
+    let reindex_req = crate::daemon_protocol::DaemonRequest::Reindex {
+        kind: crate::daemon_protocol::ReindexKind::Fts,
+    };
+    let daemon_accepted = crate::daemon_protocol::try_send_request(&daemon_socket, &reindex_req)
+        .and_then(|r| r.ok())
+        .is_some_and(|r| r.ok);
+
+    if daemon_accepted {
+        log::info!("\nFTS reindex started in background. Run `tsm doctor` to check progress.");
     } else {
         crate::tokenizer::reset_segmenter();
         log::info!("\nRebuilding FTS index...");

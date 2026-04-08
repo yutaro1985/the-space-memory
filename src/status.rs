@@ -53,7 +53,7 @@ pub struct ReindexStatus {
     pub kind: ReindexKind,
     pub total: i64,
     pub processed: i64,
-    pub errors: usize,
+    pub errors: i64,
     pub started_at: String,
 }
 

@@ -8,6 +8,11 @@ use crate::config;
 use crate::db;
 use crate::tokenizer;
 
+/// POS label for user dictionary entries in simpledic format.
+/// Re-exports `tokenizer::POS_NOUN` — user dict terms use the standard noun POS
+/// so they pass existing POS filters without special handling.
+pub const USER_DICT_POS: &str = crate::tokenizer::POS_NOUN;
+
 // ─── Enums ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,7 +134,10 @@ fn extract_raw_candidates(text: &str) -> Vec<RawCandidate> {
         let surface = token.surface.as_ref().to_string();
         let details = token.details();
 
-        let pos = if details.len() >= 2 && details[0] == "名詞" && details[1] == "固有名詞" {
+        let pos = if details.len() >= 2
+            && details[0] == crate::tokenizer::POS_NOUN
+            && details[1] == crate::tokenizer::POS_SUB_PROPER
+        {
             Some(CandidatePos::ProperNoun)
         } else if is_all_katakana(&surface) && surface.chars().count() >= 2 {
             Some(CandidatePos::Katakana)
@@ -140,10 +148,10 @@ fn extract_raw_candidates(text: &str) -> Vec<RawCandidate> {
         };
 
         if let Some(pos) = pos {
-            let normalized = surface.to_lowercase();
-            if seen.insert(normalized.clone()) {
+            let lower = surface.to_lowercase();
+            if seen.insert(lower) {
                 candidates.push(RawCandidate {
-                    surface: normalized,
+                    surface: surface.clone(),
                     pos,
                 });
             }
@@ -409,9 +417,9 @@ pub fn get_pending_in_reject_list(
 
 // ─── CSV formatting ──────────────────────────────────────────
 
-/// Format a CSV row in janome simpledic format: surface,カスタム名詞,surface
+/// Format a CSV row in janome simpledic format: surface,{USER_DICT_POS},surface
 pub fn format_simpledic_row(surface: &str) -> String {
-    format!("{surface},カスタム名詞,{surface}")
+    format!("{surface},{},{surface}", USER_DICT_POS)
 }
 
 /// Export threshold candidates to a CSV file (appending).
@@ -579,6 +587,21 @@ mod tests {
                 c.pos == CandidatePos::Ascii || c.pos == CandidatePos::ProperNoun,
                 "should be ascii or proper_noun, got {:?}",
                 c.pos
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_raw_candidates_preserves_case() {
+        let candidates = extract_raw_candidates("LoRa module development");
+        if let Some(c) = candidates
+            .iter()
+            .find(|c| c.surface.to_lowercase() == "lora")
+        {
+            assert_eq!(
+                c.surface, "LoRa",
+                "should preserve original case, got {:?}",
+                c.surface
             );
         }
     }
@@ -811,7 +834,7 @@ mod tests {
 
     #[test]
     fn test_format_simpledic_row() {
-        assert_eq!(format_simpledic_row("candle"), "candle,カスタム名詞,candle");
+        assert_eq!(format_simpledic_row("candle"), "candle,名詞,candle");
     }
 
     // ─── load_existing_surfaces tests ────────────────────────
@@ -826,11 +849,7 @@ mod tests {
     fn test_load_existing_surfaces_reads_csv() {
         let dir = tempfile::TempDir::new().unwrap();
         let csv_path = dir.path().join("dict.csv");
-        std::fs::write(
-            &csv_path,
-            "candle,カスタム名詞,candle\nlindera,カスタム名詞,lindera\n",
-        )
-        .unwrap();
+        std::fs::write(&csv_path, "candle,名詞,candle\nlindera,名詞,lindera\n").unwrap();
 
         let surfaces = load_existing_surfaces(&csv_path).unwrap();
         assert!(surfaces.contains("candle"));
@@ -842,7 +861,7 @@ mod tests {
     fn test_load_existing_surfaces_skips_comments_and_empty() {
         let dir = tempfile::TempDir::new().unwrap();
         let csv_path = dir.path().join("dict.csv");
-        std::fs::write(&csv_path, "# comment\n\ncandle,カスタム名詞,candle\n").unwrap();
+        std::fs::write(&csv_path, "# comment\n\ncandle,名詞,candle\n").unwrap();
 
         let surfaces = load_existing_surfaces(&csv_path).unwrap();
         assert_eq!(surfaces.len(), 1);
@@ -869,7 +888,7 @@ mod tests {
         assert!(csv_path.exists());
 
         let content = std::fs::read_to_string(&csv_path).unwrap();
-        assert!(content.contains("candle,カスタム名詞,candle"));
+        assert!(content.contains("candle,名詞,candle"));
 
         let status: String = conn
             .query_row(
@@ -913,7 +932,7 @@ mod tests {
         let csv_path = dir.path().join("user_dict.csv");
 
         // Write candidate to CSV manually
-        std::fs::write(&csv_path, "candle,カスタム名詞,candle\n").unwrap();
+        std::fs::write(&csv_path, "candle,名詞,candle\n").unwrap();
 
         // Insert same candidate into DB with status = 'pending'
         let now = "2026-01-01T00:00:00Z";
@@ -953,7 +972,7 @@ mod tests {
         let csv_path = dir.path().join("user_dict.csv");
 
         // Write an existing entry
-        std::fs::write(&csv_path, "existing_word,カスタム名詞,existing_word\n").unwrap();
+        std::fs::write(&csv_path, "existing_word,名詞,existing_word\n").unwrap();
 
         let now = "2026-01-01T00:00:00Z";
         conn.execute(

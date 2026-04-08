@@ -214,6 +214,17 @@ A change is merge-ready when **all** of the following hold:
   If run standalone, it auto-stops after 10 min idle (configurable via `TSM_EMBEDDER_IDLE_TIMEOUT`)
 - Search errors by default when embedder is down (`search_fallback = "error"`).
   Use `--fallback fts-only` or config for FTS-only mode
+- **User dictionary POS is `名詞`** — simpledic format: `surface,名詞,reading`.
+  Uses standard POS so existing noun filters work without special handling.
+  `#` comment lines are stripped before passing to lindera
+- **`rebuild --force` resets reject list** — DB is deleted and recreated,
+  so `dictionary_candidates` table (including rejected status) is lost.
+  Run `tsm dict reject --apply` after rebuild to re-sync from `reject_words.txt`
+- **`dict update --apply` requires daemon stopped** — writes simpledic,
+  rebuilds FTS, and attempts git commit. Stop daemon first
+- **Segmenter is cached** — `tokenizer::get_segmenter()` caches the Segmenter
+  (including user dict). Call `reset_segmenter()` after writing new simpledic
+  if rebuilding FTS in the same process
 
 ## Design Decisions (ADR)
 
@@ -232,6 +243,16 @@ see ADR-0001.
 - Chat with the user in Japanese
 - Documentation and code comments in English
 - README.md (English) and README.ja.md (Japanese) must be kept in sync
+
+## Documentation Style
+
+`docs/` guides should follow this section order:
+
+1. Design concept (Why) — background and design decisions
+2. File layout (What) — file structure and formats
+3. Operations guide (How to use) — setup, maintenance, troubleshooting
+4. Internals (How it works) — collection logic, data flow
+5. Implementation reference (Code) — source files and roles
 
 ## License Compatibility
 

@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use lindera::dictionary::{
     load_embedded_dictionary, load_user_dictionary_from_csv, DictionaryKind, UserDictionary,
@@ -9,16 +9,60 @@ use lindera::segmenter::Segmenter;
 
 use crate::config;
 
-static SEGMENTER: OnceLock<Segmenter> = OnceLock::new();
+// ─── IPADIC POS labels ──────────────────────────────────────
+// These constants come from the IPADIC dictionary format used by lindera.
+// lindera returns POS info via token.details(): details[0] is the top-level
+// POS category, details[1..] are subcategories specific to IPADIC's schema.
+// simpledic (user dict) entries only have [pos, reading] — subcategories
+// do not apply to user dictionary tokens.
+//
+// Top-level (details[0])
+pub const POS_NOUN: &str = "名詞";
+// Noun subcategories (details[1]) — IPADIC-specific, not used by simpledic
+pub const POS_SUB_PROPER: &str = "固有名詞";
+pub const POS_SUB_DEPENDENT: &str = "非自立";
+pub const POS_SUB_SUFFIX: &str = "接尾";
+pub const POS_SUB_PRONOUN: &str = "代名詞";
+pub const POS_SUB_NUMBER: &str = "数";
+
+static SEGMENTER: Mutex<Option<Arc<Segmenter>>> = Mutex::new(None);
 static STOPWORDS: OnceLock<HashSet<String>> = OnceLock::new();
 
-pub fn get_segmenter() -> &'static Segmenter {
-    SEGMENTER.get_or_init(|| {
-        let dictionary = load_embedded_dictionary(DictionaryKind::IPADIC)
-            .expect("Failed to load IPADIC dictionary");
-        let user_dict = load_user_dict(&dictionary.metadata);
-        Segmenter::new(Mode::Normal, dictionary, user_dict)
-    })
+pub fn get_segmenter() -> Arc<Segmenter> {
+    let mut guard = SEGMENTER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(seg) = guard.as_ref() {
+        return Arc::clone(seg);
+    }
+    let dictionary =
+        load_embedded_dictionary(DictionaryKind::IPADIC).expect("Failed to load IPADIC dictionary");
+    let user_dict = load_user_dict(&dictionary.metadata);
+    let seg = Arc::new(Segmenter::new(Mode::Normal, dictionary, user_dict));
+    *guard = Some(Arc::clone(&seg));
+    seg
+}
+
+/// Invalidate the cached segmenter so that the next call to
+/// `get_segmenter()` reloads the dictionary (including user dict).
+pub fn reset_segmenter() {
+    let mut guard = SEGMENTER.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
+
+/// Strip comment lines (`#`) and blank lines from simpledic content.
+/// Returns only the data lines joined by newlines, or `None` if empty.
+fn strip_simpledic_comments(content: &str) -> Option<String> {
+    let lines: Vec<&str> = content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        })
+        .collect();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
 }
 
 fn load_user_dict(metadata: &lindera::dictionary::Metadata) -> Option<UserDictionary> {
@@ -28,7 +72,29 @@ fn load_user_dict(metadata: &lindera::dictionary::Metadata) -> Option<UserDictio
         return None;
     }
 
-    match load_user_dictionary_from_csv(metadata, &path) {
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("failed to read user dictionary: {e}");
+            return None;
+        }
+    };
+
+    // Strip comments and blank lines before passing to lindera
+    // (lindera's CSV parser does not support comments)
+    let stripped = strip_simpledic_comments(&content)?;
+
+    // Write stripped content to a temp file for lindera
+    let tmp_path = std::env::temp_dir().join("tsm_user_dict.simpledic");
+    if let Err(e) = std::fs::write(&tmp_path, &stripped) {
+        log::warn!("failed to write temp user dictionary: {e}");
+        return None;
+    }
+
+    let result = load_user_dictionary_from_csv(metadata, &tmp_path);
+    let _ = std::fs::remove_file(&tmp_path);
+
+    match result {
         Ok(ud) => {
             log::info!("user dictionary loaded: {}", path.display());
             Some(ud)
@@ -132,13 +198,18 @@ pub fn extract_search_keywords(text: &str) -> Vec<String> {
     for token in tokens.iter_mut() {
         let details = token.details();
 
-        // Keep only nouns: 名詞-一般, 名詞-固有名詞, 名詞-サ変接続, 名詞-未知語, etc.
+        // Keep only nouns: 名詞-一般, 名詞-固有名詞, 名詞-サ変接続, etc.
+        // User dictionary terms also use POS "名詞" so they pass this filter naturally.
         // Skip 名詞-非自立 (もの, こと, etc.) and 名詞-接尾 (的, 化, etc.)
         // and 名詞-代名詞 (これ, それ, etc.)
-        if details.is_empty() || details[0] != "名詞" {
+        if details.is_empty() || details[0] != POS_NOUN {
             continue;
         }
-        if details.len() >= 2 && matches!(details[1], "非自立" | "接尾" | "代名詞" | "数")
+        if details.len() >= 2
+            && matches!(
+                details[1],
+                POS_SUB_DEPENDENT | POS_SUB_SUFFIX | POS_SUB_PRONOUN | POS_SUB_NUMBER
+            )
         {
             continue;
         }
@@ -190,7 +261,7 @@ pub fn extract_proper_nouns(text: &str) -> Vec<String> {
         .iter_mut()
         .filter_map(|token| {
             let details = token.details();
-            if details.len() >= 2 && details[0] == "名詞" && details[1] == "固有名詞" {
+            if details.len() >= 2 && details[0] == POS_NOUN && details[1] == POS_SUB_PROPER {
                 Some(token.surface.as_ref().to_string())
             } else {
                 None
@@ -236,10 +307,23 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_singleton_cached() {
-        let s1 = get_segmenter() as *const Segmenter;
-        let s2 = get_segmenter() as *const Segmenter;
-        assert_eq!(s1, s2);
+        let s1 = get_segmenter();
+        let s2 = get_segmenter();
+        assert!(Arc::ptr_eq(&s1, &s2));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_reset_segmenter() {
+        let s1 = get_segmenter();
+        reset_segmenter();
+        let s2 = get_segmenter();
+        assert!(
+            !Arc::ptr_eq(&s1, &s2),
+            "After reset, get_segmenter() should return a new instance"
+        );
     }
 
     // ─── extract_proper_nouns tests ──────────────────────────
@@ -357,6 +441,21 @@ mod tests {
         assert!(lora_count <= 1, "Should deduplicate: {:?}", result);
     }
 
+    // ─── strip_simpledic_comments tests ─────────────────────────
+
+    #[test]
+    fn test_strip_simpledic_comments_removes_comments_and_blanks() {
+        let input = "# date comment\n\nLoRa,名詞,LoRa\n# another\ntsmd,名詞,tsmd\n";
+        let result = strip_simpledic_comments(input).unwrap();
+        assert_eq!(result, "LoRa,名詞,LoRa\ntsmd,名詞,tsmd");
+    }
+
+    #[test]
+    fn test_strip_simpledic_comments_empty_returns_none() {
+        assert!(strip_simpledic_comments("").is_none());
+        assert!(strip_simpledic_comments("# only comments\n\n").is_none());
+    }
+
     // ─── user dictionary tests ────────────────────────────────
 
     #[test]
@@ -371,11 +470,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let dict_path = dir.path().join("test.simpledic");
         // lindera user dict: 3 fields (surface, part_of_speech, reading)
-        std::fs::write(
-            &dict_path,
-            "ドッグトラッカー,カスタム名詞,ドッグトラッカー\n",
-        )
-        .unwrap();
+        std::fs::write(&dict_path, "ドッグトラッカー,名詞,ドッグトラッカー\n").unwrap();
 
         let dictionary = load_embedded_dictionary(DictionaryKind::IPADIC).unwrap();
         let user_dict = load_user_dictionary_from_csv(&dictionary.metadata, &dict_path).unwrap();
@@ -407,6 +502,55 @@ mod tests {
             std::path::Path::new("/nonexistent/dict.simpledic"),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_keywords_includes_user_dict_terms() {
+        use lindera::dictionary::{
+            load_embedded_dictionary, load_user_dictionary_from_csv, DictionaryKind,
+        };
+        use lindera::mode::Mode;
+        use lindera::segmenter::Segmenter;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let dict_path = dir.path().join("test.simpledic");
+        std::fs::write(&dict_path, "ドッグトラッカー,名詞,ドッグトラッカー\n").unwrap();
+
+        let dictionary = load_embedded_dictionary(DictionaryKind::IPADIC).unwrap();
+        let user_dict = load_user_dictionary_from_csv(&dictionary.metadata, &dict_path).unwrap();
+        let segmenter = Segmenter::new(Mode::Normal, dictionary, Some(user_dict));
+
+        // Tokenize and extract keywords using the same logic as extract_search_keywords
+        let stopwords = get_stopwords();
+        let mut tokens = segmenter
+            .segment(std::borrow::Cow::Borrowed("ドッグトラッカーの開発"))
+            .unwrap();
+
+        let mut keywords = Vec::new();
+        for token in tokens.iter_mut() {
+            let details = token.details();
+            if details.is_empty() || details[0] != POS_NOUN {
+                continue;
+            }
+            if details.len() >= 2
+                && matches!(
+                    details[1],
+                    POS_SUB_DEPENDENT | POS_SUB_SUFFIX | POS_SUB_PRONOUN | POS_SUB_NUMBER
+                )
+            {
+                continue;
+            }
+            let surface = token.surface.as_ref();
+            if !stopwords.contains(surface) {
+                keywords.push(surface.to_string());
+            }
+        }
+
+        assert!(
+            keywords.contains(&"ドッグトラッカー".to_string()),
+            "User dict term with 名詞 POS should be included in keywords: {:?}",
+            keywords
+        );
     }
 
     #[test]

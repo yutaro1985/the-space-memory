@@ -309,7 +309,7 @@ tsm stop 2>/dev/null
 sleep 1
 
 USER_DICT_PATH="$TSM_STATE_DIR/user_dict.simpledic"
-echo "${DICT_WORD},カスタム名詞,${DICT_WORD}" >> "$USER_DICT_PATH"
+echo "${DICT_WORD},名詞,${DICT_WORD}" >> "$USER_DICT_PATH"
 log "Added '$DICT_WORD' to user dictionary"
 
 log "Rebuilding FTS index..."
@@ -328,6 +328,11 @@ assert_json "dict: '$DICT_WORD' found before dict (via constituent tokens)" \
 # Verify search still works after the stop→rebuild→start cycle
 run search_json "メロス 激怒" --fallback fts-only
 assert_json "dict: search works after rebuild" \
+    'any(.[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
+
+# Verify dict-registered word works as a standalone search query (#104)
+run search_json "$DICT_WORD" --fallback fts-only
+assert_json "dict: standalone search for dict term '$DICT_WORD' hits hashire-melos" \
     'any(.[]; .source_file | contains("hashire-melos"))' "$CAPTURED_OUTPUT" "$CAPTURED_EXIT"
 
 # ── Edge cases ────────────────────────────────────────────────────────

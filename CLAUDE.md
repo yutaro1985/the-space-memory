@@ -79,7 +79,8 @@ src/
 - **Vector search**: ruri-v3-30m (256-dim) semantic search. Embedder child process (`tsmd --embedder`) runs on UNIX socket
 - **Scoring**: RRF (Reciprocal Rank Fusion) combining FTS5 and vector results. Time decay + status penalty applied
 - **DB schema changes require `rebuild --apply`** (e.g. FTS tokenizer changes)
-- **Live re-indexing**: `tsm reindex {all|fts|vectors}` — daemon runs batched re-index in background, yielding to search between batches
+- **Live re-indexing**: `tsm reindex {all|fts|vectors}` — daemon runs batched
+  re-index in background, yielding to search between batches
 
 ## Data Flow
 

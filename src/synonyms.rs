@@ -293,22 +293,7 @@ pub fn sync_user_synonyms(
         upserted += 1;
     }
 
-    // Delete DB pairs with source='user' that are not in the file
-    let mut stmt = conn.prepare("SELECT word_a, word_b FROM synonyms WHERE source = 'user'")?;
-    let db_pairs: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    let mut deleted = 0;
-    for (a, b) in &db_pairs {
-        if !file_pairs.contains(&(a.clone(), b.clone())) {
-            conn.execute(
-                "DELETE FROM synonyms WHERE word_a = ? AND word_b = ? AND source = 'user'",
-                rusqlite::params![a, b],
-            )?;
-            deleted += 1;
-        }
-    }
+    let deleted = delete_stale_user_pairs(conn, &file_pairs)?;
 
     tx.commit()?;
 
@@ -318,6 +303,29 @@ pub fn sync_user_synonyms(
         skipped,
         total: file_pairs.len(),
     })
+}
+
+/// Delete source='user' pairs from DB that are not in the given set.
+fn delete_stale_user_pairs(
+    conn: &Connection,
+    keep: &HashSet<(String, String)>,
+) -> anyhow::Result<usize> {
+    let mut stmt = conn.prepare("SELECT word_a, word_b FROM synonyms WHERE source = 'user'")?;
+    let db_pairs: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut deleted = 0;
+    for (a, b) in &db_pairs {
+        if !keep.contains(&(a.clone(), b.clone())) {
+            conn.execute(
+                "DELETE FROM synonyms WHERE word_a = ? AND word_b = ? AND source = 'user'",
+                rusqlite::params![a, b],
+            )?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
 }
 
 /// Record a hit on a synonym pair (increments hits, updates last_hit).

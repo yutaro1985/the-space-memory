@@ -285,12 +285,11 @@ pub fn sync_user_synonyms(
     let now = chrono::Utc::now().to_rfc3339();
     let mut upserted = 0;
     for (a, b) in &file_pairs {
-        conn.execute(
+        upserted += conn.execute(
             "INSERT OR IGNORE INTO synonyms (word_a, word_b, score, source, hits, created)
              VALUES (?, ?, ?, 'user', 0, ?)",
             rusqlite::params![a, b, USER_SCORE, now],
         )?;
-        upserted += 1;
     }
 
     let deleted = delete_stale_user_pairs(conn, &file_pairs)?;

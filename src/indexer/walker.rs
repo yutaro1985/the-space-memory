@@ -3,8 +3,8 @@
 //! `ContentWalker` is the single source of truth for "which files should tsm
 //! index?" It centralizes the ad-hoc walker logic that used to be split
 //! across `cli::discover_watch_dirs` (now deleted), the watcher event
-//! filter, and the stdin path. `cli::collect_content_files` is retained as
-//! a thin wrapper for callers that supply an explicit `index_root`.
+//! filter, and the stdin path. Callers needing an `index_root` override
+//! (the daemon, `cmd_rebuild`) use `from_env_with_index_root` directly.
 //!
 //! ## Ignore resolution
 //!
@@ -52,25 +52,43 @@ pub struct ContentWalker {
 }
 
 impl ContentWalker {
-    /// Construct a walker from a fully-resolved config.
-    ///
-    /// The `.tsmignore` file is read from `cfg.project_root` — the directory
-    /// containing `tsm.toml`, resolved at config-load time (see
-    /// `ResolvedConfig::from_env`). Missing files are silently treated as
-    /// empty — this is the common case for users who have not opted in.
-    pub fn from_config(cfg: &ResolvedConfig) -> Self {
-        let matcher = build_matcher(
-            &cfg.index_root,
-            &cfg.project_root,
-            &cfg.ignore_file,
-            cfg.respect_gitignore,
-        );
+    /// Core constructor taking raw values. Every other `from_*` constructor
+    /// funnels through this — there is exactly one place where a walker is
+    /// assembled, and exactly one place that owns the `.tsmignore` lookup
+    /// against `project_root`. The `.tsmignore` file is read from
+    /// `project_root` (the directory containing `tsm.toml`); a missing file
+    /// is silently treated as empty — the common case for users who have
+    /// not opted in. See the module-level doc for the rationale on routing
+    /// every constructor through `new` instead of mutating `ResolvedConfig`.
+    pub fn new(
+        index_root: PathBuf,
+        project_root: &Path,
+        extensions: Vec<String>,
+        content_dirs: Vec<ContentDir>,
+        respect_gitignore: bool,
+        ignore_file: &str,
+    ) -> Self {
+        let matcher = build_matcher(&index_root, project_root, ignore_file, respect_gitignore);
         Self {
-            index_root: cfg.index_root.clone(),
-            content_dirs: cfg.content_dirs.clone(),
-            extensions: cfg.extensions.clone(),
+            index_root,
+            content_dirs,
+            extensions,
             matcher,
         }
+    }
+
+    /// Construct a walker from a fully-resolved config. Thin wrapper that
+    /// unpacks `cfg` and forwards to `new`. See `new` for `.tsmignore`
+    /// lookup semantics.
+    pub fn from_config(cfg: &ResolvedConfig) -> Self {
+        Self::new(
+            cfg.index_root.clone(),
+            &cfg.project_root,
+            cfg.extensions.clone(),
+            cfg.content_dirs.clone(),
+            cfg.respect_gitignore,
+            &cfg.ignore_file,
+        )
     }
 
     /// Convenience constructor that rebuilds `ResolvedConfig` from disk + env.
@@ -87,10 +105,19 @@ impl ContentWalker {
     /// value in `ResolvedConfig`. Used by the daemon handler whose
     /// `index_root` argument is the authoritative one per request (and by
     /// tests that exercise the handler with a tempdir).
+    ///
+    /// `project_root` (and therefore `.tsmignore` location) still comes from
+    /// the loaded config — only `index_root` is overridden.
     pub fn from_env_with_index_root(index_root: &Path) -> Self {
-        let mut cfg = crate::config::ResolvedConfig::from_env();
-        cfg.index_root = index_root.to_path_buf();
-        Self::from_config(&cfg)
+        let cfg = crate::config::ResolvedConfig::from_env();
+        Self::new(
+            index_root.to_path_buf(),
+            &cfg.project_root,
+            cfg.extensions,
+            cfg.content_dirs,
+            cfg.respect_gitignore,
+            &cfg.ignore_file,
+        )
     }
 
     /// True when `path` must not be indexed.
@@ -98,8 +125,9 @@ impl ContentWalker {
     /// Crate-internal because the combined gate — ignore rules *and*
     /// extension allowlist — is exposed via the `IngestPolicy::accepts`
     /// impl. Bypassing that composition (e.g. calling only `is_ignored`)
-    /// would silently re-introduce the drift this PR set out to fix, so
-    /// production callers must go through `accepts()`.
+    /// would let a path skip the extension allowlist — the historical
+    /// drift fixed in #134 / #135. Production callers must go through
+    /// `accepts()`.
     pub(crate) fn is_ignored(&self, path: &Path) -> bool {
         let Ok(rel) = path.strip_prefix(&self.index_root) else {
             return true;
@@ -734,6 +762,36 @@ state_dir = "/tmp/unused-state"
         let files = walker.collect_files();
         // File is still collected → index_root/.tsmignore was not loaded.
         assert!(files.iter().any(|p| p.ends_with("public/ok.md")));
+    }
+
+    // ─── new() constructor ─────────────────────────────────────────────
+
+    #[test]
+    fn new_takes_raw_params_without_resolved_config() {
+        // The point of `new()` is to let callers (notably the daemon's
+        // per-request handler) construct a walker with an `index_root` that
+        // differs from the loaded config WITHOUT mutating the singleton's
+        // pub fields. Verify the constructor accepts raw params and produces
+        // a working walker.
+        let project = TempDir::new().unwrap();
+        let index = TempDir::new().unwrap();
+        write_file(project.path(), ".tsmignore", "skip/\n");
+        write_file(index.path(), "keep/a.md", "a");
+        write_file(index.path(), "skip/b.md", "b");
+
+        let walker = ContentWalker::new(
+            index.path().to_path_buf(),
+            project.path(),
+            vec!["md".into()],
+            vec![],
+            false,
+            ".tsmignore",
+        );
+        let files = walker.collect_files();
+        assert!(files.iter().any(|p| p.ends_with("keep/a.md")));
+        assert!(!files
+            .iter()
+            .any(|p| p.components().any(|c| c.as_os_str() == "skip")));
     }
 
     #[test]

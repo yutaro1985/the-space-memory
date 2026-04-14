@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -9,7 +9,6 @@ use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
 
 use the_space_memory::config;
 use the_space_memory::daemon_protocol::{self, DaemonRequest};
-use the_space_memory::indexer::ContentWalker;
 
 use crate::SHUTDOWN;
 
@@ -47,10 +46,13 @@ pub fn run() -> Result<()> {
     let mut debouncer =
         new_debouncer(Duration::from_secs(2), tx).context("Failed to create file watcher")?;
 
-    // Single walker instance governs both directory-registration and
-    // event-filtering so both views cannot drift under config reload.
-    let mut walker = ContentWalker::from_env();
-    let mut watched = setup_watches(&mut debouncer, &walker);
+    // The watcher's scope comes purely from `index_root` + `content_dirs`
+    // — it does NOT consult `.tsmignore`, `extensions`, or `respect_gitignore`.
+    // Those are policy concerns owned by the daemon's indexer via
+    // `IngestPolicy`. Keeping the watcher oblivious means the event stream
+    // is independent of user policy edits (no SIGHUP needed to pick up
+    // `.tsmignore` changes — the indexer's next gate call does that).
+    let mut watched = setup_watches(&mut debouncer, &index_root);
 
     if watched.is_empty() {
         anyhow::bail!(
@@ -72,10 +74,10 @@ pub fn run() -> Result<()> {
         if RELOAD_REQUESTED.swap(false, Ordering::SeqCst) {
             log::info!("reload notification received, updating watch targets");
             config::reload();
-            // Rebuild the walker so .tsmignore / .gitignore / extensions
-            // edits take effect without a daemon restart.
-            walker = ContentWalker::from_env();
-            update_watches(&mut debouncer, &mut watched, &walker);
+            // Only `content_dirs` can change the watch scope; a new
+            // `.tsmignore` would not affect registration (the watcher
+            // doesn't know about it by design).
+            update_watches(&mut debouncer, &mut watched, &index_root);
             log::info!("now watching {} directories", watched.len());
         }
 
@@ -143,24 +145,47 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// Directories to watch recursively with inotify. Pure tsm.toml plumbing:
+/// — if `content_dirs` is configured, watch those specific subdirs;
+/// — otherwise watch `index_root` itself.
+///
+/// No policy consultation: this is scope-for-registration only. Events
+/// from force-excluded or user-ignored paths will still arrive and be
+/// filtered later by the daemon's `IngestPolicy`.
+fn watch_targets(index_root: &Path) -> Vec<PathBuf> {
+    let dirs = config::content_dirs();
+    if dirs.is_empty() {
+        vec![index_root.to_path_buf()]
+    } else {
+        dirs.iter()
+            .map(|d| index_root.join(&d.path))
+            .filter(|p| {
+                let ok = p.is_dir();
+                if !ok {
+                    log::warn!("content_dir {} not found; will not be watched", p.display());
+                }
+                ok
+            })
+            .collect()
+    }
+}
+
 /// Set up watch targets and return the set of watched directories.
 fn setup_watches(
     debouncer: &mut notify_debouncer_mini::Debouncer<
         notify_debouncer_mini::notify::RecommendedWatcher,
     >,
-    walker: &ContentWalker,
+    index_root: &Path,
 ) -> HashSet<PathBuf> {
     let mut watched = HashSet::new();
-    for full_dir in walker.watch_dirs() {
-        if full_dir.is_dir() {
-            if let Err(e) = debouncer
-                .watcher()
-                .watch(&full_dir, RecursiveMode::Recursive)
-            {
-                log::warn!("cannot watch {}: {e}", full_dir.display());
-            } else {
-                watched.insert(full_dir);
-            }
+    for full_dir in watch_targets(index_root) {
+        if let Err(e) = debouncer
+            .watcher()
+            .watch(&full_dir, RecursiveMode::Recursive)
+        {
+            log::warn!("cannot watch {}: {e}", full_dir.display());
+        } else {
+            watched.insert(full_dir);
         }
     }
     watched
@@ -172,13 +197,9 @@ fn update_watches(
         notify_debouncer_mini::notify::RecommendedWatcher,
     >,
     current: &mut HashSet<PathBuf>,
-    walker: &ContentWalker,
+    index_root: &Path,
 ) {
-    let desired: HashSet<PathBuf> = walker
-        .watch_dirs()
-        .into_iter()
-        .filter(|d| d.is_dir())
-        .collect();
+    let desired: HashSet<PathBuf> = watch_targets(index_root).into_iter().collect();
 
     // Unwatch removed dirs
     for dir in current.difference(&desired) {
@@ -241,37 +262,28 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_run_watcher_no_content_dirs() {
+    fn test_watch_targets_default_is_index_root() {
+        // No content_dirs configured → watcher registers index_root itself.
+        // The watcher's scope is purely config-driven (content_dirs /
+        // index_root), independent of .tsmignore.
         let dir = tempfile::TempDir::new().unwrap();
-        // CD into the tempdir so ContentWalker::from_env() sees no
-        // tsm.toml and falls back to default empty content_dirs.
         let _cwd = CwdGuard::change_to(dir.path());
         unsafe { std::env::set_var("TSM_INDEX_ROOT", dir.path().as_os_str()) };
-        the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon {
-            name: "test",
-        })
-        .ok();
 
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut debouncer = new_debouncer(Duration::from_secs(2), tx).unwrap();
-        let walker = ContentWalker::from_env();
-        let watched = setup_watches(&mut debouncer, &walker);
-        assert!(watched.is_empty());
+        let targets = watch_targets(dir.path());
+        assert_eq!(targets, vec![dir.path().to_path_buf()]);
 
         unsafe { std::env::remove_var("TSM_INDEX_ROOT") };
     }
 
     #[test]
     #[serial_test::serial]
-    fn test_run_watcher_shutdown() {
+    fn test_run_watcher_registers_index_root() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir(dir.path().join("notes")).unwrap();
 
         SHUTDOWN.store(true, Ordering::SeqCst);
 
-        // Tempdir has no tsm.toml, so walker auto-discovers subdirs under
-        // TSM_INDEX_ROOT (which is the same tempdir). Guards ensure the
-        // next test doesn't inherit this CWD.
         let _cwd = CwdGuard::change_to(dir.path());
         unsafe { std::env::set_var("TSM_INDEX_ROOT", dir.path().as_os_str()) };
         the_space_memory::logging::init_logger(the_space_memory::logging::LogMode::Daemon {
@@ -283,9 +295,9 @@ mod tests {
         // We test the individual pieces rather than run() which also inits logger
         let (tx, rx) = std::sync::mpsc::channel();
         let mut debouncer = new_debouncer(Duration::from_secs(2), tx).unwrap();
-        let walker = ContentWalker::from_env();
-        let watched = setup_watches(&mut debouncer, &walker);
+        let watched = setup_watches(&mut debouncer, dir.path());
         assert!(!watched.is_empty());
+        assert!(watched.contains(dir.path()));
 
         // The main loop condition checks SHUTDOWN
         assert!(SHUTDOWN.load(Ordering::SeqCst));

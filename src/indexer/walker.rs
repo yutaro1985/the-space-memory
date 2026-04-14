@@ -147,15 +147,6 @@ impl ContentWalker {
         out
     }
 
-    /// Top-level directories the watcher should register for inotify.
-    ///
-    /// Mirrors `collect_files` roots so watcher and indexer cover the same
-    /// tree. Ignored top-level dirs are dropped here too, preventing useless
-    /// recursive watches under `.git/`.
-    pub fn watch_dirs(&self) -> Vec<PathBuf> {
-        self.collection_roots()
-    }
-
     /// The starting points for traversal — either explicit `content_dirs`
     /// entries or auto-discovered immediate subdirectories of `index_root`.
     fn collection_roots(&self) -> Vec<PathBuf> {
@@ -669,21 +660,6 @@ extensions = ["md", "txt"]
     }
 
     // ─── Watch directory discovery ────────────────────────────────────
-
-    #[test]
-    #[serial_test::serial]
-    fn watch_dirs_skips_excluded_subtrees() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("notes")).unwrap();
-        std::fs::create_dir_all(tmp.path().join("private")).unwrap();
-        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
-        write_file(tmp.path(), ".tsmignore", "private/\n");
-        let (walker, _cwd) = walker_in(&tmp);
-        let dirs = walker.watch_dirs();
-        assert!(dirs.iter().any(|p| p.ends_with("notes")));
-        assert!(!dirs.iter().any(|p| p.ends_with("private")));
-        assert!(!dirs.iter().any(|p| p.ends_with(".git")));
-    }
 
     // ─── content_dirs mode × .tsmignore ───────────────────────────────
 

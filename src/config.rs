@@ -1,5 +1,5 @@
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 use directories::ProjectDirs;
@@ -210,18 +210,48 @@ pub struct ResolvedConfig {
     /// File extensions to include during indexing (without leading dot).
     /// Default: `["md"]`. Config: `[index].extensions`.
     pub extensions: Vec<String>,
+
+    /// Directory tsm treats as the user's workspace — where `.tsmignore`
+    /// and `tsm.toml` are expected to live. Derived at load time from the
+    /// parent of the first successfully-loaded config file (or CWD if no
+    /// config file was found). Not user-configurable via TOML.
+    ///
+    /// Exception: when only an XDG config exists (no `tsm.toml` in CWD
+    /// and no `$TSM_CONFIG`), this becomes the XDG config directory.
+    /// `.tsmignore` lookup will not find a workspace ignore file in that
+    /// case; users running from a project directory should have a local
+    /// `tsm.toml` or set `$TSM_CONFIG` to their workspace file.
+    ///
+    /// Invariant: the value is set once at `from_env()` time and must
+    /// stay consistent with the config file whose values populated the
+    /// other fields. Mutating this field after construction (possible
+    /// because it is `pub` — matches the rest of the struct) breaks
+    /// that provenance link. Don't.
+    ///
+    /// Default: CWD. Config: (derived).
+    pub project_root: PathBuf,
 }
 
 impl ResolvedConfig {
     /// Resolve all config values from environment variables, config files, and defaults.
     pub fn from_env() -> Self {
-        let file_cfg = load_config_from(&config_file_candidates());
-        Self::from_config_file(&file_cfg)
+        let (file_cfg, loaded_root) = load_config_from(&config_file_candidates());
+        let project_root = loaded_root.unwrap_or_else(cwd_fallback);
+        Self::from_config_file(&file_cfg, project_root)
     }
 
-    /// Resolve from a pre-loaded `ConfigFile` (still reads env vars for overrides).
-    /// Visible within the crate for testing; production code should use `from_env()`.
-    pub(crate) fn from_config_file(file_cfg: &ConfigFile) -> Self {
+    /// Resolve from a pre-loaded `ConfigFile` with an explicit project root.
+    ///
+    /// `project_root` is the directory tsm treats as the user's workspace —
+    /// typically the directory that held the `tsm.toml` that was loaded,
+    /// falling back to the current working directory. It is where
+    /// `.tsmignore` is resolved from (patterns still anchor at
+    /// `index_root`, only the file lookup uses `project_root`).
+    ///
+    /// Visible within the crate for testing; production code should use
+    /// `from_env()`. Tests pass a tempdir to avoid mutating process-global
+    /// CWD state.
+    pub(crate) fn from_config_file(file_cfg: &ConfigFile, project_root: PathBuf) -> Self {
         let state_dir = env_or("TSM_STATE_DIR", file_cfg.state_dir.as_ref())
             .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
 
@@ -350,8 +380,26 @@ impl ResolvedConfig {
             respect_gitignore,
             ignore_file,
             extensions,
+            project_root,
         }
     }
+}
+
+/// Fallback when no config file was loaded and no explicit project_root
+/// was passed. Mirrors the implicit behavior before `project_root` was
+/// introduced as a first-class field — tsm falls back to whatever
+/// directory the user ran it from. If even CWD is unavailable (deleted,
+/// unmounted), `std::env::temp_dir()` is used to guarantee the value is
+/// always a valid `PathBuf`.
+fn cwd_fallback() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|e| {
+        log::warn!(
+            "current_dir() failed ({e}); using temp dir for project_root \
+             — .tsmignore lookup will likely miss unless TSM_CONFIG points \
+             at an absolute path"
+        );
+        std::env::temp_dir()
+    })
 }
 
 /// Read an env var as PathBuf, falling back to a config file value.
@@ -435,6 +483,13 @@ pub fn reload() -> Vec<String> {
     if old.user_dict_path != new_cfg.user_dict_path {
         warnings.push("user_dict_path changed; requires `tsm restart`".to_string());
     }
+    if old.project_root != new_cfg.project_root {
+        warnings.push(format!(
+            "project_root changed ({} → {}); requires `tsm restart`",
+            old.project_root.display(),
+            new_cfg.project_root.display()
+        ));
+    }
 
     *w = new_cfg;
 
@@ -448,11 +503,22 @@ pub fn reload() -> Vec<String> {
 }
 
 /// Merge config values from `candidates` in order; first non-None value for each field wins.
-fn load_config_from(candidates: &[PathBuf]) -> ConfigFile {
+///
+/// Returns `(merged, project_root)` where `project_root` is the parent
+/// directory of the first successfully-read-and-parsed config file,
+/// resolved against CWD for relative candidates like `"tsm.toml"`.
+/// `None` when no candidate loaded; callers substitute their own fallback
+/// (typically `std::env::current_dir()`). Relative candidates with no
+/// parent component (e.g. bare `"tsm.toml"`) are resolved against CWD via
+/// `current_dir().join(path)` before the parent is extracted so callers
+/// always get an absolute directory — no `canonicalize` syscall is used,
+/// see `project_root_from` for the rationale.
+fn load_config_from(candidates: &[PathBuf]) -> (ConfigFile, Option<PathBuf>) {
     // Determine which path was explicitly requested via TSM_CONFIG (if any)
     let explicit_config = std::env::var_os("TSM_CONFIG").map(PathBuf::from);
 
     let mut merged = ConfigFile::default();
+    let mut loaded_root: Option<PathBuf> = None;
 
     // Iterate in priority order (highest first); `.or()` keeps first-seen value
     for path in candidates {
@@ -475,6 +541,9 @@ fn load_config_from(candidates: &[PathBuf]) -> ConfigFile {
                 continue;
             }
         };
+        if loaded_root.is_none() {
+            loaded_root = project_root_from(path);
+        }
         merged.state_dir = merged.state_dir.or(file.state_dir);
         merged.index_root = merged.index_root.or(file.index_root);
         merged.embedder_socket_path = merged.embedder_socket_path.or(file.embedder_socket_path);
@@ -510,7 +579,28 @@ fn load_config_from(candidates: &[PathBuf]) -> ConfigFile {
             merged.index.extensions = file.index.extensions;
         }
     }
-    merged
+    (merged, loaded_root)
+}
+
+/// Resolve `path` to the parent directory of the config file. Handles
+/// both absolute paths (e.g. `TSM_CONFIG=/foo/tsm.toml` → `/foo`) and
+/// relative ones (bare `"tsm.toml"` → CWD-joined parent).
+///
+/// Avoids `canonicalize` — it's a syscall that can race the preceding
+/// `read_to_string` (file disappears, symlink breaks) and losing it
+/// silently breaks the invariant "config values and project_root come
+/// from the same file". Since we already read the file successfully,
+/// we know its parent deterministically from the path we were given.
+fn project_root_from(path: &Path) -> Option<PathBuf> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        // Relative path — resolve against CWD. `current_dir()` failure
+        // is the only way we return None here; the file read already
+        // succeeded so the parent exists on disk.
+        std::env::current_dir().ok()?.join(path)
+    };
+    abs.parent().map(|p| p.to_path_buf())
 }
 
 fn config_file_candidates() -> Vec<PathBuf> {
@@ -581,6 +671,10 @@ pub fn ignore_file() -> String {
 
 pub fn index_extensions() -> Vec<String> {
     resolved().extensions.clone()
+}
+
+pub fn project_root() -> PathBuf {
+    resolved().project_root.clone()
 }
 
 // ─── Derived paths ───────────────────────────────────────────────
@@ -749,10 +843,11 @@ mod tests {
 
     /// Build a ResolvedConfig from inline TOML. Does NOT clear env vars —
     /// callers that need clean defaults must clear TSM_* vars themselves
-    /// or use #[serial].
+    /// or use #[serial]. `project_root` is stubbed to `/tmp/unused-root`
+    /// since these tests don't exercise `.tsmignore` resolution.
     fn resolved_from_toml(toml_content: &str) -> ResolvedConfig {
         let file_cfg: ConfigFile = toml::from_str(toml_content).unwrap();
-        ResolvedConfig::from_config_file(&file_cfg)
+        ResolvedConfig::from_config_file(&file_cfg, PathBuf::from("/tmp/unused-root"))
     }
 
     // ─── Constants ──────────────────────────────────────────────────
@@ -921,11 +1016,14 @@ embedder_idle_timeout_secs = 1200
         )
         .unwrap();
 
-        let cfg = load_config_from(&[config_path]);
+        let (cfg, root) = load_config_from(&[config_path.clone()]);
         assert_eq!(cfg.state_dir, Some(PathBuf::from("/custom/data")));
         assert_eq!(cfg.index_root, Some(PathBuf::from("/custom/root")));
         assert_eq!(cfg.embedder_idle_timeout_secs, Some(1200));
         assert!(cfg.daemon_socket_path.is_none());
+        // project_root derives from the loaded file's parent — the same
+        // absolute path that was passed in, no canonicalization applied.
+        assert_eq!(root.as_deref(), config_path.parent());
     }
 
     #[test]
@@ -945,22 +1043,48 @@ index_root = "/low-root"
         )
         .unwrap();
 
-        let cfg = load_config_from(&[high, low]);
+        let (cfg, root) = load_config_from(&[high.clone(), low]);
         assert_eq!(cfg.state_dir, Some(PathBuf::from("/high")));
         assert_eq!(cfg.index_root, Some(PathBuf::from("/low-root")));
+        // project_root comes from the FIRST successfully-loaded candidate,
+        // regardless of which fields subsequent files contribute.
+        assert_eq!(root.as_deref(), high.parent());
     }
 
     #[test]
     fn test_load_config_empty_candidates() {
-        let cfg = load_config_from(&[]);
+        let (cfg, root) = load_config_from(&[]);
         assert!(cfg.state_dir.is_none());
         assert!(cfg.index_root.is_none());
+        assert!(root.is_none(), "no config loaded → no project_root");
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_config_relative_path_resolves_against_cwd() {
+        // A bare relative candidate like "tsm.toml" must yield a
+        // project_root derived from CWD (not a bare empty path), with no
+        // canonicalize syscall in the picture. Avoids the race where the
+        // file could change between read and canonicalize.
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        std::fs::write(dir.path().join("tsm.toml"), r#"state_dir = "/rel""#).unwrap();
+
+        let (cfg, root) = load_config_from(&[PathBuf::from("tsm.toml")]);
+
+        std::env::set_current_dir(&prev).unwrap();
+
+        assert_eq!(cfg.state_dir, Some(PathBuf::from("/rel")));
+        // project_root should be CWD (tempdir), not empty / None.
+        assert_eq!(root.unwrap(), dir.path());
     }
 
     #[test]
     fn test_load_config_missing_file_skipped() {
-        let cfg = load_config_from(&[PathBuf::from("/nonexistent/tsm.toml")]);
+        let (cfg, root) = load_config_from(&[PathBuf::from("/nonexistent/tsm.toml")]);
         assert!(cfg.state_dir.is_none());
+        assert!(root.is_none());
     }
 
     #[test]
@@ -973,8 +1097,10 @@ index_root = "/low-root"
         let valid = dir.path().join("good.toml");
         std::fs::write(&valid, r#"state_dir = "/good""#).unwrap();
 
-        let cfg = load_config_from(&[malformed, valid]);
+        let (cfg, root) = load_config_from(&[malformed, valid.clone()]);
         assert_eq!(cfg.state_dir, Some(PathBuf::from("/good")));
+        // project_root is derived from the VALID file, not the malformed one.
+        assert_eq!(root.as_deref(), valid.parent());
     }
 
     // ─── Pure functions ─────────────────────────────────────────────
@@ -1038,20 +1164,30 @@ index_root = "/low-root"
     #[serial]
     fn test_env_var_overrides_config_state_dir() {
         std::env::set_var("TSM_STATE_DIR", "/env/override");
-        let cfg = ResolvedConfig::from_config_file(&ConfigFile {
-            state_dir: Some(PathBuf::from("/from/config")),
-            ..Default::default()
-        });
+        let cfg = ResolvedConfig::from_config_file(
+            &ConfigFile {
+                state_dir: Some(PathBuf::from("/from/config")),
+                ..Default::default()
+            },
+            PathBuf::from("/tmp/unused-root"),
+        );
         std::env::remove_var("TSM_STATE_DIR");
         // env wins over config file value
         assert_eq!(cfg.state_dir, PathBuf::from("/env/override"));
+        // Also pins that the project_root parameter lands on the struct
+        // field verbatim — a one-line guard against a copy-paste bug in
+        // from_config_file's Self {...} literal.
+        assert_eq!(cfg.project_root, PathBuf::from("/tmp/unused-root"));
     }
 
     #[test]
     #[serial]
     fn test_env_var_overrides_config_timeout() {
         std::env::set_var("TSM_EMBEDDER_IDLE_TIMEOUT", "42");
-        let cfg = ResolvedConfig::from_config_file(&ConfigFile::default());
+        let cfg = ResolvedConfig::from_config_file(
+            &ConfigFile::default(),
+            PathBuf::from("/tmp/unused-root"),
+        );
         std::env::remove_var("TSM_EMBEDDER_IDLE_TIMEOUT");
         assert_eq!(cfg.embedder_idle_timeout_secs, 42);
     }
@@ -1060,10 +1196,13 @@ index_root = "/low-root"
     #[serial]
     fn test_env_var_invalid_integer_falls_back_to_config() {
         std::env::set_var("TSM_EMBEDDER_IDLE_TIMEOUT", "not_a_number");
-        let cfg = ResolvedConfig::from_config_file(&ConfigFile {
-            embedder_idle_timeout_secs: Some(999),
-            ..Default::default()
-        });
+        let cfg = ResolvedConfig::from_config_file(
+            &ConfigFile {
+                embedder_idle_timeout_secs: Some(999),
+                ..Default::default()
+            },
+            PathBuf::from("/tmp/unused-root"),
+        );
         std::env::remove_var("TSM_EMBEDDER_IDLE_TIMEOUT");
         // Invalid env var → falls back to config file value
         assert_eq!(cfg.embedder_idle_timeout_secs, 999);
@@ -1073,7 +1212,10 @@ index_root = "/low-root"
     #[serial]
     fn test_env_var_overrides_config_socket() {
         std::env::set_var("TSM_EMBEDDER_SOCKET", "/tmp/custom.sock");
-        let cfg = ResolvedConfig::from_config_file(&ConfigFile::default());
+        let cfg = ResolvedConfig::from_config_file(
+            &ConfigFile::default(),
+            PathBuf::from("/tmp/unused-root"),
+        );
         std::env::remove_var("TSM_EMBEDDER_SOCKET");
         assert_eq!(cfg.embedder_socket_path, PathBuf::from("/tmp/custom.sock"));
     }
@@ -1407,6 +1549,36 @@ half_life_days = 180
         let warnings = reload();
         // No structural fields changed, so no warnings
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_reload_warns_on_project_root_change() {
+        // Force singleton initialization from whatever config the host has.
+        let _ = resolved();
+
+        // Point TSM_CONFIG at a tempdir tsm.toml whose parent differs from
+        // the host's CWD — forces project_root to change on next reload.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("tsm.toml");
+        std::fs::write(&config_path, "").unwrap();
+        std::env::set_var("TSM_CONFIG", &config_path);
+
+        let warnings = reload();
+
+        std::env::remove_var("TSM_CONFIG");
+        reload(); // restore to host config
+
+        assert!(
+            warnings.iter().any(|w| w.contains("project_root")),
+            "expected project_root warning, got: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("project_root") && w.contains("tsm restart")),
+            "project_root warning should call out `tsm restart`: {warnings:?}"
+        );
     }
 
     #[test]

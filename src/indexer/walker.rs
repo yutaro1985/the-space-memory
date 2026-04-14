@@ -76,6 +76,16 @@ impl ContentWalker {
         Self::from_config(&crate::config::ResolvedConfig::from_env())
     }
 
+    /// Construct a walker rooted at a specific `index_root`, overriding the
+    /// value in `ResolvedConfig`. Used by the daemon handler whose
+    /// `index_root` argument is the authoritative one per request (and by
+    /// tests that exercise the handler with a tempdir).
+    pub fn from_env_with_index_root(index_root: &Path) -> Self {
+        let mut cfg = crate::config::ResolvedConfig::from_env();
+        cfg.index_root = index_root.to_path_buf();
+        Self::from_config(&cfg)
+    }
+
     /// True when `path` must not be indexed.
     ///
     /// Used for single-path decisions (watcher events, stdin filtering).

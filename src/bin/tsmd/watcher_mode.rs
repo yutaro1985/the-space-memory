@@ -10,6 +10,7 @@ use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
 use the_space_memory::cli;
 use the_space_memory::config;
 use the_space_memory::daemon_protocol::{self, DaemonRequest};
+use the_space_memory::indexer::ContentWalker;
 
 use crate::SHUTDOWN;
 
@@ -48,6 +49,7 @@ pub fn run() -> Result<()> {
         new_debouncer(Duration::from_secs(2), tx).context("Failed to create file watcher")?;
 
     let mut watched = setup_watches(&mut debouncer, &index_root);
+    let mut walker = ContentWalker::from_env();
 
     if watched.is_empty() {
         anyhow::bail!(
@@ -69,6 +71,9 @@ pub fn run() -> Result<()> {
         if RELOAD_REQUESTED.swap(false, Ordering::SeqCst) {
             log::info!("reload notification received, updating watch targets");
             config::reload();
+            // Rebuild the walker so .tsmignore / .gitignore / extensions
+            // edits take effect without a daemon restart.
+            walker = ContentWalker::from_env();
             update_watches(&mut debouncer, &mut watched, &index_root);
             log::info!("now watching {} directories", watched.len());
         }
@@ -80,7 +85,10 @@ pub fn run() -> Result<()> {
                     if event.kind != DebouncedEventKind::Any {
                         continue;
                     }
-                    if event.path.extension().is_none_or(|ext| ext != "md") {
+                    // Single predicate replaces the old hard-coded .md check.
+                    // Ignore rules + extension allowlist now run through one
+                    // code path shared with the full-index walker.
+                    if walker.is_ignored(&event.path) || !walker.extension_allowed(&event.path) {
                         continue;
                     }
                     match event.path.strip_prefix(&index_root) {

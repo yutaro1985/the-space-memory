@@ -29,10 +29,11 @@ pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
     let conn = db::get_connection(&db_path)?;
     let index_root = config::index_root();
 
+    let walker = indexer::ContentWalker::from_env();
     let file_paths: Vec<PathBuf> = if files_from_stdin {
-        read_paths_from_stdin(&index_root)
+        read_paths_from_stdin(&index_root, &walker)
     } else {
-        collect_content_files(&index_root)
+        walker.collect_files()
     };
 
     let stats = run_index(&conn, &file_paths, &index_root)?;
@@ -45,141 +46,39 @@ pub fn cmd_index(files_from_stdin: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn read_paths_from_stdin(index_root: &Path) -> Vec<PathBuf> {
+/// Read one-path-per-line from stdin, resolve against `index_root`, and drop
+/// anything the walker says to ignore. The #134 spec routes all four
+/// traversal paths through the same ignore rules, including stdin — a hook
+/// that accidentally hands us `.git/HEAD.md` won't silently pollute the DB.
+pub fn read_paths_from_stdin(index_root: &Path, walker: &indexer::ContentWalker) -> Vec<PathBuf> {
     std::io::stdin()
         .lock()
         .lines()
         .map_while(Result::ok)
         .filter(|line| !line.trim().is_empty())
         .map(|line| index_root.join(line.trim()))
+        .filter(|path| {
+            if walker.is_ignored(path) {
+                log::warn!("skipping {} (excluded by ignore rules)", path.display());
+                false
+            } else {
+                true
+            }
+        })
         .collect()
 }
 
-pub fn collect_content_files(index_root: &Path) -> Vec<PathBuf> {
-    let dirs = config::content_dirs();
-    if dirs.is_empty() {
-        // Auto-discover: recursively find .md in non-hidden subdirs of index_root
-        let mut files = Vec::new();
-        for subdir in discover_subdirs(index_root) {
-            collect_md_files_excluding_hidden(&subdir, &mut files);
-        }
-        files
-    } else {
-        let mut files = Vec::new();
-        for dir in dirs {
-            let full_dir = index_root.join(&dir.path);
-            if full_dir.is_dir() {
-                collect_md_files(&full_dir, &mut files);
-            } else {
-                log::warn!(
-                    "content_dir '{}' not found at {}; skipping",
-                    dir.path,
-                    full_dir.display()
-                );
-            }
-        }
-        files
-    }
+/// Collect all files under `index_root` that should be indexed.
+///
+/// Kept as a thin wrapper so daemon and rebuild call sites don't need to
+/// know about `ContentWalker` directly.
+pub fn collect_content_files(_index_root: &Path) -> Vec<PathBuf> {
+    indexer::ContentWalker::from_env().collect_files()
 }
 
-fn collect_md_files_excluding_hidden(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            log::warn!("cannot read directory {}: {e}", dir.display());
-            return;
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                log::warn!("cannot read entry in {}: {e}", dir.display());
-                continue;
-            }
-        };
-        let path = entry.path();
-        if path.is_dir() {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') {
-                continue;
-            }
-            collect_md_files_excluding_hidden(&path, out);
-        } else if path.extension().is_some_and(|e| e == "md") {
-            out.push(path);
-        }
-    }
-}
-
-/// Discover immediate non-hidden subdirectories of a directory.
-fn discover_subdirs(dir: &Path) -> Vec<PathBuf> {
-    let mut result = Vec::new();
-    match std::fs::read_dir(dir) {
-        Err(e) => {
-            log::warn!(
-                "cannot read {}: {e}; no subdirectories discovered",
-                dir.display()
-            );
-        }
-        Ok(entries) => {
-            for entry in entries {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(e) => {
-                        log::warn!("cannot read entry in {}: {e}", dir.display());
-                        continue;
-                    }
-                };
-                let path = entry.path();
-                if path.is_dir() {
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if !name.starts_with('.') {
-                        result.push(path);
-                    }
-                }
-            }
-        }
-    }
-    result
-}
-
-/// List directories to watch (for the watcher thread). When content_dirs is configured,
-/// returns those paths. Otherwise discovers non-hidden subdirs under index_root.
-pub fn discover_watch_dirs(index_root: &Path) -> Vec<PathBuf> {
-    let dirs = config::content_dirs();
-    if dirs.is_empty() {
-        discover_subdirs(index_root)
-    } else {
-        let mut result = Vec::new();
-        for dir in dirs {
-            let full_dir = index_root.join(&dir.path);
-            if full_dir.is_dir() {
-                result.push(full_dir);
-            } else {
-                log::warn!(
-                    "content_dir '{}' not found at {}; will not be watched",
-                    dir.path,
-                    full_dir.display()
-                );
-            }
-        }
-        result
-    }
-}
-
-pub fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_md_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "md") {
-            out.push(path);
-        }
-    }
+/// Top-level directories the fs-watcher should register for inotify.
+pub fn discover_watch_dirs(_index_root: &Path) -> Vec<PathBuf> {
+    indexer::ContentWalker::from_env().watch_dirs()
 }
 
 pub struct SearchOptions<'a> {
@@ -1692,56 +1591,9 @@ mod tests {
         assert_eq!(parsed["results"][0]["content"], "# Hello\n\nWorld.");
     }
 
-    #[test]
-    fn test_collect_md_files() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let sub = dir.path().join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(dir.path().join("a.md"), "test").unwrap();
-        std::fs::write(sub.join("b.md"), "test").unwrap();
-        std::fs::write(dir.path().join("c.txt"), "test").unwrap();
-
-        let mut files = Vec::new();
-        collect_md_files(dir.path(), &mut files);
-        assert_eq!(files.len(), 2);
-        assert!(files.iter().all(|f| f.extension().unwrap() == "md"));
-    }
-
-    #[test]
-    fn test_collect_md_files_empty_dir() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut files = Vec::new();
-        collect_md_files(dir.path(), &mut files);
-        assert!(files.is_empty());
-    }
-
-    #[test]
-    fn test_collect_md_files_nonexistent() {
-        let mut files = Vec::new();
-        collect_md_files(Path::new("/nonexistent/path"), &mut files);
-        assert!(files.is_empty());
-    }
-
-    #[test]
-    fn test_collect_content_files() {
-        let dir = tempfile::TempDir::new().unwrap();
-        // Create one CONTENT_DIR
-        let notes_dir = dir.path().join("daily/notes");
-        std::fs::create_dir_all(&notes_dir).unwrap();
-        std::fs::write(notes_dir.join("test.md"), "# Test").unwrap();
-        std::fs::write(notes_dir.join("ignore.txt"), "not md").unwrap();
-
-        let files = collect_content_files(dir.path());
-        assert_eq!(files.len(), 1);
-        assert!(files[0].to_string_lossy().contains("test.md"));
-    }
-
-    #[test]
-    fn test_collect_content_files_empty() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let files = collect_content_files(dir.path());
-        assert!(files.is_empty());
-    }
+    // Walker behavior is now covered by indexer::walker::tests. The wrapper
+    // functions in this file (collect_content_files, discover_watch_dirs) are
+    // thin forwards that read the config singleton.
 
     #[test]
     fn test_format_json_include_content_file_missing() {
@@ -1946,45 +1798,6 @@ mod tests {
         assert_eq!(parsed["issue_count"], 0);
         assert_eq!(parsed["sections"][0]["name"], "Test");
         assert_eq!(parsed["sections"][0]["items"][0]["status"], "ok");
-    }
-
-    #[test]
-    fn test_discover_subdirs_excludes_hidden() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir(dir.path().join("visible")).unwrap();
-        std::fs::create_dir(dir.path().join(".hidden")).unwrap();
-        std::fs::create_dir(dir.path().join("another")).unwrap();
-
-        let dirs = super::discover_subdirs(dir.path());
-        let names: Vec<&str> = dirs
-            .iter()
-            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
-            .collect();
-        assert!(names.contains(&"visible"));
-        assert!(names.contains(&"another"));
-        assert!(!names.contains(&".hidden"));
-    }
-
-    #[test]
-    fn test_collect_md_files_excluding_hidden() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let visible = dir.path().join("visible");
-        std::fs::create_dir(&visible).unwrap();
-        std::fs::write(visible.join("note.md"), "# Note").unwrap();
-
-        let hidden = dir.path().join(".hidden");
-        std::fs::create_dir(&hidden).unwrap();
-        std::fs::write(hidden.join("secret.md"), "# Secret").unwrap();
-
-        let mut files = Vec::new();
-        super::collect_md_files_excluding_hidden(dir.path(), &mut files);
-
-        let names: Vec<&str> = files
-            .iter()
-            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
-            .collect();
-        assert!(names.contains(&"note.md"));
-        assert!(!names.contains(&"secret.md"));
     }
 
     #[test]

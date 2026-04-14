@@ -69,10 +69,26 @@ pub fn handle_request(
         }
 
         DaemonRequest::Index { files } => {
+            let walker = crate::indexer::ContentWalker::from_env_with_index_root(index_root);
             let file_paths: Vec<PathBuf> = if files.is_empty() {
-                cli::collect_content_files(index_root)
+                walker.collect_files()
             } else {
-                files.iter().map(|f| index_root.join(f)).collect()
+                // Filter caller-supplied paths (from stdin or the fs-watcher)
+                // through the same ignore rules, per the #134 spec. Anything
+                // that should not be in the DB must never reach the indexer,
+                // even if a misconfigured hook streams it in.
+                files
+                    .iter()
+                    .map(|f| index_root.join(f))
+                    .filter(|p| {
+                        if walker.is_ignored(p) {
+                            log::warn!("skipping {} (excluded by ignore rules)", p.display());
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .collect()
             };
             match cli::run_index(conn, &file_paths, index_root) {
                 Ok(stats) => DaemonResponse::success(serde_json::json!({

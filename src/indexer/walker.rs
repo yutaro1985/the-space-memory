@@ -402,6 +402,75 @@ state_dir = "/tmp/unused-state"
             .any(|p| p.components().any(|c| c.as_os_str() == ".tsm")));
     }
 
+    // ─── Multi-repo / middle-path matching ────────────────────────────
+    //
+    // Orchestration use case: `index_root` points at a parent dir containing
+    // several independent repos (e.g. `/workspaces/{company, daily, ...}`),
+    // each with its own `.git/`, `target/`, etc. Patterns and forced
+    // excludes must match at any depth, not just top-level.
+
+    #[test]
+    #[serial_test::serial]
+    fn forced_excludes_match_at_any_depth() {
+        // `.git/` and `.tsm/` under *any* sub-repo must be excluded, not
+        // only at index_root level. Ensures `has_forced_excluded_component`
+        // scans every path component.
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "company/.git/HEAD.md", "no");
+        write_file(tmp.path(), "daily/.tsm/sentinel.md", "no");
+        write_file(tmp.path(), "daily/notes/keep.md", "yes");
+        let (walker, _cwd) = walker_in(&tmp);
+        let files = walker.collect_files();
+        assert!(files.iter().any(|p| p.ends_with("daily/notes/keep.md")));
+        assert!(!files
+            .iter()
+            .any(|p| p.components().any(|c| c.as_os_str() == ".git")));
+        assert!(!files
+            .iter()
+            .any(|p| p.components().any(|c| c.as_os_str() == ".tsm")));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tsmignore_dir_pattern_matches_nested_subrepos() {
+        // `.tsmignore` pattern `target/` with no leading slash must match
+        // `target` at every depth per gitignore spec — crucial for the
+        // orchestration layout where each sub-repo has its own target/.
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "company/target/out.md", "no");
+        write_file(tmp.path(), "daily/target/out.md", "no");
+        write_file(tmp.path(), "the-space-memory/target/out.md", "no");
+        write_file(tmp.path(), "daily/notes/keep.md", "yes");
+        write_file(tmp.path(), ".tsmignore", "target/\n");
+        let (walker, _cwd) = walker_in(&tmp);
+        let files = walker.collect_files();
+        assert!(files.iter().any(|p| p.ends_with("daily/notes/keep.md")));
+        assert!(!files
+            .iter()
+            .any(|p| p.components().any(|c| c.as_os_str() == "target")));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tsmignore_leading_slash_anchors_to_index_root() {
+        // With leading slash, patterns are anchored: `/worktrees/` excludes
+        // only the top-level `worktrees/`, NOT sub-repo worktrees dirs.
+        // This is the escape hatch when the any-depth default is too broad.
+        let tmp = TempDir::new().unwrap();
+        write_file(tmp.path(), "worktrees/wt1/a.md", "no");
+        write_file(tmp.path(), "company/worktrees/wt2/b.md", "yes");
+        write_file(tmp.path(), ".tsmignore", "/worktrees/\n");
+        let (walker, _cwd) = walker_in(&tmp);
+        let files = walker.collect_files();
+        // Top-level worktrees/ is excluded.
+        assert!(!files.iter().any(|p| p.ends_with("worktrees/wt1/a.md")));
+        // Nested company/worktrees/ is kept — leading-slash anchor stopped
+        // the pattern from matching at middle paths.
+        assert!(files
+            .iter()
+            .any(|p| p.ends_with("company/worktrees/wt2/b.md")));
+    }
+
     #[test]
     #[serial_test::serial]
     #[cfg(unix)]

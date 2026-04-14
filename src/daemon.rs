@@ -6,6 +6,7 @@ use rusqlite::Connection;
 use crate::cli;
 use crate::config;
 use crate::daemon_protocol::{DaemonRequest, DaemonResponse};
+use crate::indexer::IngestPolicy;
 
 /// Handle a single daemon request and return a response.
 ///
@@ -78,7 +79,24 @@ pub fn handle_request(
             let file_paths: Vec<PathBuf> = if files.is_empty() {
                 walker.collect_files()
             } else {
-                files.iter().map(|f| index_root.join(f)).collect()
+                // Pre-log caller-supplied paths that will be rejected.
+                // The indexer still enforces the gate (and is the authority),
+                // but it logs rejections at debug level — fine for the
+                // full-walk case where the walker already pre-filtered, but
+                // too quiet for misconfigured hooks piping `.git/HEAD.md`
+                // over stdin or through the fs-watcher. Surfacing at warn
+                // here preserves the observability that the pre-refactor
+                // call sites provided.
+                let joined: Vec<PathBuf> = files.iter().map(|f| index_root.join(f)).collect();
+                for p in &joined {
+                    if !walker.accepts(p) {
+                        log::warn!(
+                            "skipping {} (excluded by policy — ignore rules or extension mismatch)",
+                            p.display()
+                        );
+                    }
+                }
+                joined
             };
             match cli::run_index(conn, &file_paths, index_root, &walker) {
                 Ok(stats) => DaemonResponse::success(serde_json::json!({
@@ -320,8 +338,9 @@ mod tests {
         let resp = handle_request(&conn, req, dir.path(), &flag);
         assert!(resp.ok);
         let payload = resp.payload.unwrap();
-        // Only daily/ok.md survives the ignore filter.
+        // Only daily/ok.md survives the ignore filter; the other is a skip.
         assert_eq!(payload["indexed"], 1);
+        assert_eq!(payload["skipped"], 1);
     }
 
     /// Non-allowlisted extensions must be dropped even when explicitly
@@ -346,6 +365,7 @@ mod tests {
         let payload = resp.payload.unwrap();
         // b.csv is not in the default ["md"] allowlist.
         assert_eq!(payload["indexed"], 1);
+        assert_eq!(payload["skipped"], 1);
     }
 
     /// `files: []` triggers a full walk via ContentWalker — verify the

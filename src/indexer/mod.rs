@@ -1094,6 +1094,17 @@ mod tests {
             true
         }
     }
+
+    /// Test-only policy that rejects every path. Used to verify the
+    /// `index_all` gate actually calls `policy.accepts()` and honors
+    /// its result — a property the existing walker-through-daemon tests
+    /// can't prove, because the walker already pre-filters the inputs.
+    struct RejectAll;
+    impl IngestPolicy for RejectAll {
+        fn accepts(&self, _: &Path) -> bool {
+            false
+        }
+    }
     use crate::test_utils::setup_db_with_dir as setup;
     use std::io::Write;
 
@@ -1862,6 +1873,100 @@ mod tests {
         let files = vec![dir.path().join("daily/notes/c.md")];
         let stats = index_all_with_progress(&conn, &files, dir.path(), &AcceptAll, None).unwrap();
         assert_eq!(stats.indexed, 1);
+    }
+
+    /// Prove the policy gate actually gates: without it, a RejectAll
+    /// policy would still index the file. Pins the contract that
+    /// `index_all` calls `policy.accepts()` and honors rejection.
+    #[test]
+    fn test_index_all_policy_gate_skips_rejected_paths() {
+        let (conn, dir) = setup();
+        let path = write_md(dir.path(), "daily/notes/test.md", "# Hello\n\nWorld.\n");
+
+        let stats = index_all(&conn, &[path], dir.path(), &RejectAll).unwrap();
+
+        assert_eq!(stats.skipped, 1);
+        assert_eq!(stats.indexed, 0);
+        assert_eq!(stats.removed, 0);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected path must not reach the DB");
+    }
+
+    /// Pins the design invariant documented at `index_all_with_progress`:
+    /// the policy gate fires BEFORE the existence check, so a path that
+    /// the policy rejects never triggers the delete-stale-doc codepath
+    /// as a side effect. Without this test, reordering the checks would
+    /// silently change deletion semantics.
+    #[test]
+    fn test_index_all_policy_gate_fires_before_existence_check() {
+        let (conn, dir) = setup();
+        let path = write_md(dir.path(), "daily/notes/test.md", "# Hello\n\nWorld.\n");
+        index_file(&conn, &path, dir.path()).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 1);
+
+        // Delete on disk, then call index_all with a rejecting policy.
+        std::fs::remove_file(&path).unwrap();
+        let stats = index_all(&conn, &[path], dir.path(), &RejectAll).unwrap();
+
+        assert_eq!(
+            stats.removed, 0,
+            "policy-rejected path must not trigger DB cleanup"
+        );
+        assert_eq!(stats.skipped, 1);
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 1, "existing row must survive — gate ran first");
+    }
+
+    /// Progress callback fires for every input path, including those
+    /// rejected by the policy. This is an opinionated design choice
+    /// (the caller sees a stable total count) — pin it so a well-meaning
+    /// "only count processed items" refactor is caught.
+    #[test]
+    fn test_index_all_with_progress_callback_fires_for_rejected_paths() {
+        struct RejectSecond {
+            seen: std::cell::Cell<usize>,
+        }
+        impl IngestPolicy for RejectSecond {
+            fn accepts(&self, _: &Path) -> bool {
+                let n = self.seen.get();
+                self.seen.set(n + 1);
+                n != 1 // index #0 accepted, #1 rejected
+            }
+        }
+
+        let (conn, dir) = setup();
+        write_md(dir.path(), "daily/notes/a.md", "# A\n\nContent A.\n");
+        write_md(dir.path(), "daily/notes/b.md", "# B\n\nContent B.\n");
+        let files = vec![
+            dir.path().join("daily/notes/a.md"),
+            dir.path().join("daily/notes/b.md"),
+        ];
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        let cb = |current: usize, total: usize, _path: &std::path::Path| {
+            calls.borrow_mut().push((current, total));
+        };
+
+        let policy = RejectSecond {
+            seen: std::cell::Cell::new(0),
+        };
+        let stats = index_all_with_progress(&conn, &files, dir.path(), &policy, Some(&cb)).unwrap();
+        assert_eq!(stats.indexed, 1);
+        assert_eq!(stats.skipped, 1);
+
+        let calls = calls.into_inner();
+        assert_eq!(
+            calls.len(),
+            2,
+            "callback must fire for every input path, policy decisions notwithstanding"
+        );
     }
 
     #[test]

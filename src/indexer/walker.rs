@@ -104,10 +104,12 @@ impl ContentWalker {
 
     /// True when `path` must not be indexed.
     ///
-    /// Used for single-path decisions (watcher events, stdin filtering).
-    /// Paths outside `index_root` are considered ignored so callers cannot
-    /// accidentally index content the walker would never discover.
-    pub fn is_ignored(&self, path: &Path) -> bool {
+    /// Crate-internal because the combined gate — ignore rules *and*
+    /// extension allowlist — is exposed via the `IngestPolicy::accepts`
+    /// impl. Bypassing that composition (e.g. calling only `is_ignored`)
+    /// would silently re-introduce the drift this PR set out to fix, so
+    /// production callers must go through `accepts()`.
+    pub(crate) fn is_ignored(&self, path: &Path) -> bool {
         let Ok(rel) = path.strip_prefix(&self.index_root) else {
             return true;
         };
@@ -130,7 +132,8 @@ impl ContentWalker {
 
     /// Returns true when `path`'s extension is in the allowlist.
     /// Files without an extension or with an unlisted one are rejected.
-    pub fn extension_allowed(&self, path: &Path) -> bool {
+    /// Crate-internal for the same reason as `is_ignored` — see above.
+    pub(crate) fn extension_allowed(&self, path: &Path) -> bool {
         match path.extension().and_then(|e| e.to_str()) {
             Some(ext) => self.extensions.iter().any(|e| e == ext),
             None => false,

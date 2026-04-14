@@ -213,8 +213,21 @@ pub struct ResolvedConfig {
 
     /// Directory tsm treats as the user's workspace — where `.tsmignore`
     /// and `tsm.toml` are expected to live. Derived at load time from the
-    /// parent of the first successfully-loaded config file (or the CWD if
-    /// no config file was found). Not user-configurable via TOML.
+    /// parent of the first successfully-loaded config file (or CWD if no
+    /// config file was found). Not user-configurable via TOML.
+    ///
+    /// Exception: when only an XDG config exists (no `tsm.toml` in CWD
+    /// and no `$TSM_CONFIG`), this becomes the XDG config directory.
+    /// `.tsmignore` lookup will not find a workspace ignore file in that
+    /// case; users running from a project directory should have a local
+    /// `tsm.toml` or set `$TSM_CONFIG` to their workspace file.
+    ///
+    /// Invariant: the value is set once at `from_env()` time and must
+    /// stay consistent with the config file whose values populated the
+    /// other fields. Mutating this field after construction (possible
+    /// because it is `pub` — matches the rest of the struct) breaks
+    /// that provenance link. Don't.
+    ///
     /// Default: CWD. Config: (derived).
     pub project_root: PathBuf,
 }
@@ -373,10 +386,11 @@ impl ResolvedConfig {
 }
 
 /// Fallback when no config file was loaded and no explicit project_root
-/// was passed. Mirrors the pre-#137 implicit behavior — tsm falls back to
-/// whatever directory the user ran it from. If even CWD is unavailable
-/// (deleted, unmounted), `std::env::temp_dir()` is used to guarantee the
-/// value is always a valid `PathBuf`.
+/// was passed. Mirrors the implicit behavior before `project_root` was
+/// introduced as a first-class field — tsm falls back to whatever
+/// directory the user ran it from. If even CWD is unavailable (deleted,
+/// unmounted), `std::env::temp_dir()` is used to guarantee the value is
+/// always a valid `PathBuf`.
 fn cwd_fallback() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|e| {
         log::warn!(
@@ -495,8 +509,10 @@ pub fn reload() -> Vec<String> {
 /// resolved against CWD for relative candidates like `"tsm.toml"`.
 /// `None` when no candidate loaded; callers substitute their own fallback
 /// (typically `std::env::current_dir()`). Relative candidates with no
-/// parent component (e.g. bare `"tsm.toml"`) are canonicalized before the
-/// parent is extracted so callers always get an absolute directory.
+/// parent component (e.g. bare `"tsm.toml"`) are resolved against CWD via
+/// `current_dir().join(path)` before the parent is extracted so callers
+/// always get an absolute directory — no `canonicalize` syscall is used,
+/// see `project_root_from` for the rationale.
 fn load_config_from(candidates: &[PathBuf]) -> (ConfigFile, Option<PathBuf>) {
     // Determine which path was explicitly requested via TSM_CONFIG (if any)
     let explicit_config = std::env::var_os("TSM_CONFIG").map(PathBuf::from);

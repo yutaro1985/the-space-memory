@@ -1174,6 +1174,10 @@ index_root = "/low-root"
         std::env::remove_var("TSM_STATE_DIR");
         // env wins over config file value
         assert_eq!(cfg.state_dir, PathBuf::from("/env/override"));
+        // Also pins that the project_root parameter lands on the struct
+        // field verbatim — a one-line guard against a copy-paste bug in
+        // from_config_file's Self {...} literal.
+        assert_eq!(cfg.project_root, PathBuf::from("/tmp/unused-root"));
     }
 
     #[test]
@@ -1545,6 +1549,36 @@ half_life_days = 180
         let warnings = reload();
         // No structural fields changed, so no warnings
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_reload_warns_on_project_root_change() {
+        // Force singleton initialization from whatever config the host has.
+        let _ = resolved();
+
+        // Point TSM_CONFIG at a tempdir tsm.toml whose parent differs from
+        // the host's CWD — forces project_root to change on next reload.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("tsm.toml");
+        std::fs::write(&config_path, "").unwrap();
+        std::env::set_var("TSM_CONFIG", &config_path);
+
+        let warnings = reload();
+
+        std::env::remove_var("TSM_CONFIG");
+        reload(); // restore to host config
+
+        assert!(
+            warnings.iter().any(|w| w.contains("project_root")),
+            "expected project_root warning, got: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("project_root") && w.contains("tsm restart")),
+            "project_root warning should call out `tsm restart`: {warnings:?}"
+        );
     }
 
     #[test]
